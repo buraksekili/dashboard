@@ -2486,3 +2486,49 @@ type BackupStorageLocationBucketObject struct {
 // BackupStorageLocationBucketObjectList represents an array of Backup Storage Location Bucket Objects.
 // swagger:model BackupStorageLocationBucketObjectList
 type BackupStorageLocationBucketObjectList []BackupStorageLocationBucketObject
+
+// KubeconfigToken describes one kubeconfig token issued for a user cluster. It never
+// contains the token secret or its hash.
+// swagger:model KubeconfigToken
+type KubeconfigToken struct {
+	// ID is the token ID, the part between the cluster ID and the colon in the token value.
+	ID string `json:"id"`
+	// ClusterID is the ID of the cluster the token is valid for.
+	ClusterID string `json:"clusterID"`
+	// UserID is the KKP user ID of the token owner.
+	UserID string `json:"userID"`
+	// UserEmail is the email of the token owner.
+	UserEmail string `json:"userEmail,omitempty"`
+	// Label is the name the owner gave the token.
+	Label string `json:"label,omitempty"`
+	// IssueTime is when the token was issued.
+	IssueTime apiv1.Time `json:"issueTime"`
+	// ExpirationTime is when the token stops working.
+	ExpirationTime apiv1.Time `json:"expirationTime"`
+	// LastUsedTime is the last time the cluster accepted the token, written at most every few minutes.
+	LastUsedTime *apiv1.Time `json:"lastUsedTime,omitempty"`
+	// State is "Active" or "Disabled" as seen on the seed; empty when not known yet.
+	State string `json:"state,omitempty"`
+	// Reason explains a Disabled state.
+	Reason string `json:"reason,omitempty"`
+}
+
+// KubeconfigTokenPatch holds the fields of a kubeconfig token a user may change.
+// swagger:model KubeconfigTokenPatch
+type KubeconfigTokenPatch struct {
+	// Label is the new name of the token, at most 128 characters.
+	Label string `json:"label"`
+}
+
+// KubeconfigTokenSettings describes the lifetime rules for new kubeconfig tokens.
+// swagger:model KubeconfigTokenSettings
+type KubeconfigTokenSettings struct {
+	// DefaultLifetime is the lifetime of a new token when the export request names none, as a Go duration.
+	DefaultLifetime string `json:"defaultLifetime"`
+	// MaxLifetime is the longest lifetime an export request may ask for, as a Go duration.
+	MaxLifetime string `json:"maxLifetime"`
+	// IdleTimeout is how long a token may stay unused before the cluster rejects it, as a Go duration.
+	IdleTimeout string `json:"idleTimeout"`
+	// MaxActivePerUserPerCluster is how many unexpired tokens one user may hold for one cluster.
+	MaxActivePerUserPerCluster int `json:"maxActivePerUserPerCluster"`
+}

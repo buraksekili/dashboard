@@ -121,6 +121,10 @@ type TokenClaims struct {
 	Groups  []string
 	Nonce   string
 	Expiry  apiv1.Time
+	// Audience is the aud claim of an OIDC ID token.
+	Audience []string
+	// EmailVerified is the email_verified claim of an OIDC ID token; false when missing.
+	EmailVerified bool
 }
 
 // OIDCConfiguration is a struct that holds
@@ -142,4 +146,8 @@ type OIDCConfiguration struct {
 	OfflineAccessAsScope bool
 	// SkipTLSVerify skip TLS verification for the token issuer
 	SkipTLSVerify bool
+	// RejectedAudiences lists audiences an ID token must not carry, even next to
+	// ClientID. With a separate dashboard login client this holds the issuer client ID,
+	// so tokens issued for user clusters cannot log in to the KKP API.
+	RejectedAudiences []string
 }

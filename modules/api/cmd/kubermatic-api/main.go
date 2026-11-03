@@ -52,6 +52,7 @@ import (
 	"os"
 	"time"
 
+	httptransport "github.com/go-kit/kit/transport/http"
 	"github.com/go-logr/zapr"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
@@ -63,8 +64,10 @@ import (
 
 	"k8c.io/dashboard/v2/pkg/handler"
 	"k8c.io/dashboard/v2/pkg/handler/auth"
+	"k8c.io/dashboard/v2/pkg/handler/middleware"
 	"k8c.io/dashboard/v2/pkg/handler/v1/common"
 	v2 "k8c.io/dashboard/v2/pkg/handler/v2"
+	"k8c.io/dashboard/v2/pkg/handler/v2/userclustertoken"
 	"k8c.io/dashboard/v2/pkg/provider"
 	auth2 "k8c.io/dashboard/v2/pkg/provider/auth"
 	authtypes "k8c.io/dashboard/v2/pkg/provider/auth/types"
@@ -383,6 +386,11 @@ func createInitProviders(ctx context.Context, options serverRunOptions, masterCf
 		log.Fatalw("failed to create an openid authenticator", zap.Any("issuer", options.oidcURL), zap.Any("oidcClientID", options.oidcAuthenticatorClientID), zap.Error(err))
 	}
 
+	oidcLoginVerifier, err := createOIDCLoginVerifier(options, oidcIssuerVerifier)
+	if err != nil {
+		log.Fatalw("failed to create an openid login client", zap.Any("issuer", options.oidcURL), zap.Any("oidcClientID", options.oidcAuthenticatorClientID), zap.Error(err))
+	}
+
 	oidcIssuerVerifierProviderGetter := auth2.OIDCIssuerVerifierProviderFactory(
 		oidcIssuerVerifier,
 		options.oidcIssuerRedirectURI,
@@ -481,7 +489,7 @@ func createInitProviders(ctx context.Context, options serverRunOptions, masterCf
 		applicationDefinitionProvider:                  applicationDefinitionProvider,
 		privilegedOperatingSystemProfileProviderGetter: privilegedOperatingSystemProfileProviderGetter,
 		oidcIssuerVerifierProviderGetter:               oidcIssuerVerifierProviderGetter,
-		oidcIssuerVerifier:                             oidcIssuerVerifier,
+		oidcLoginVerifier:                              oidcLoginVerifier,
 	}, nil
 }
 
@@ -495,6 +503,15 @@ func createOIDCClients(oidcIssuerConfiguration *authtypes.OIDCConfiguration, oid
 		),
 		caBundle.CertPool(),
 	)
+}
+
+// createOIDCLoginVerifier returns the OIDC client for the dashboard login flow. Without a separate
+// login configuration the login keeps using the issuer client.
+func createOIDCLoginVerifier(options serverRunOptions, oidcIssuerVerifier authtypes.OIDCIssuerVerifier) (authtypes.OIDCIssuerVerifier, error) {
+	if options.oidcLoginConfiguration == nil {
+		return oidcIssuerVerifier, nil
+	}
+	return createOIDCClients(options.oidcLoginConfiguration, options.oidcIssuerRedirectURI, options.caBundle)
 }
 
 func createAuthClients(options serverRunOptions, prov providers) (authtypes.TokenVerifier, authtypes.TokenExtractor, error) {
@@ -609,7 +626,7 @@ func createAPIHandler(
 		ApplicationDefinitionProvider:                  prov.applicationDefinitionProvider,
 		PrivilegedOperatingSystemProfileProviderGetter: prov.privilegedOperatingSystemProfileProviderGetter,
 		OIDCIssuerVerifierProviderGetter:               prov.oidcIssuerVerifierProviderGetter,
-		OIDCIssuerVerifier:                             prov.oidcIssuerVerifier,
+		OIDCLoginVerifier:                              prov.oidcLoginVerifier,
 		Versions:                                       options.versions,
 		CABundle:                                       options.caBundle.CertPool(),
 		Features:                                       options.featureGates,
@@ -640,6 +657,38 @@ func createAPIHandler(
 	r.RegisterV1Admin(v1Router)
 	r.RegisterV1Websocket(v1Router, options.overwriteRegistry)
 	rv2.RegisterV2(v2Router, options.featureGates.Enabled(features.OIDCKubeCfgEndpoint))
+
+	// per-cluster kubeconfig tokens: the export flow and the token management API
+	// exist only when the feature is on and the dashboard login has its own client
+	if options.userClusterTokensEnabled() {
+		rateLimiter := userclustertoken.NewUserRateLimiter()
+		userclustertoken.NewExportHandler(
+			prov.oidcLoginVerifier,
+			options.oidcIssuerClientID,
+			prov.clusterProviderGetter,
+			prov.seedsGetter,
+			prov.seedClientGetter,
+			prov.user,
+			prov.memberMapper,
+			prov.configGetter,
+			mgr.GetClient(),
+			rateLimiter,
+		).Install(v2Router)
+		userclustertoken.NewTokenAPI(
+			tokenVerifiers,
+			prov.user,
+			prov.userInfoGetter,
+			prov.project,
+			prov.privilegedProject,
+			prov.clusterProviderGetter,
+			prov.seedsGetter,
+			prov.configGetter,
+			mgr.GetClient(),
+			// the same shared options every other API route gets
+			httptransport.ServerBefore(middleware.TokenExtractor(tokenExtractors)),
+			httptransport.ServerErrorEncoder(handler.ErrorEncoder),
+		).Install(v2Router)
+	}
 
 	mainRouter.Methods(http.MethodGet).
 		Path("/api/swagger.json").

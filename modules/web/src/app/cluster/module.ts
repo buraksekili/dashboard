@@ -67,6 +67,8 @@ import {RevokeTokenComponent} from './details/cluster/revoke-token/component';
 import {RuleGroupsComponent} from './details/cluster/mla/rule-groups/component';
 import {RuleGroupDialog} from './details/cluster/mla/rule-groups/rule-group-dialog/component';
 import {ShareKubeconfigComponent} from './details/cluster/share-kubeconfig/component';
+import {KubeconfigTokensComponent} from './details/cluster/kubeconfig-tokens/component';
+import {EditTokenLabelDialogComponent} from './details/cluster/kubeconfig-tokens/edit-label/component';
 import {VersionPickerComponent} from './details/shared/version-picker/component';
 import {ClusterListComponent} from './list/cluster/component';
 import {ExternalClusterDetailsComponent} from './details/external-cluster/component';
@@ -126,6 +128,8 @@ const components: any[] = [
   BaremetalProviderSettingsComponent,
   EditSSHKeysComponent,
   ShareKubeconfigComponent,
+  KubeconfigTokensComponent,
+  EditTokenLabelDialogComponent,
   ClusterPanelComponent,
   AddBindingDialogComponent,
   VersionPickerComponent,

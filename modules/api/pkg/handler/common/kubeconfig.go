@@ -48,6 +48,7 @@ import (
 	apiserverserviceaccount "k8s.io/apiserver/pkg/authentication/serviceaccount"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/client-go/util/retry"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -500,52 +501,16 @@ func CreateOIDCKubeconfigSecretEndpoint(
 			return nil, common.KubernetesErrorToHTTPError(err)
 		}
 
-		// create a kubeconfig that contains OIDC tokens
-		oidcKubeCfg := clientcmdapi.NewConfig()
-		{
-			// grab admin kubeconfig to read the cluster info
-			var clusterFromAdminKubeCfg *clientcmdapi.Cluster
-			for clusterName, configCluster := range adminKubeConfig.Clusters {
-				if clusterName == req.ClusterID {
-					clusterFromAdminKubeCfg = configCluster
-				}
-
-				// If the cluster has an external address, we need to add to use that address in the KubeConfig
-				if cluster.Status.Address.APIServerExternalAddress != "" {
-					clusterFromAdminKubeCfg.Server = cluster.Status.Address.APIServerExternalAddress
-				}
-			}
-			if clusterFromAdminKubeCfg == nil {
-				return nil, utilerrors.New(http.StatusInternalServerError, fmt.Sprintf("unable to construct kubeconfig because couldn't find %s cluster entry in existing kubecfg", req.ClusterID))
-			}
-
-			// create cluster entry
-			clientCmdCluster := clientcmdapi.NewCluster()
-			clientCmdCluster.Server = clusterFromAdminKubeCfg.Server
-			clientCmdCluster.CertificateAuthorityData = clusterFromAdminKubeCfg.CertificateAuthorityData
-			oidcKubeCfg.Clusters[req.ClusterID] = clientCmdCluster
-
-			// create auth entry
-			clientCmdAuth := clientcmdapi.NewAuthInfo()
-			clientCmdAuthProvider := &clientcmdapi.AuthProviderConfig{Config: map[string]string{}}
-			clientCmdAuthProvider.Name = oidc
-			clientCmdAuthProvider.Config["id-token"] = oidcTokens.IDToken
-			clientCmdAuthProvider.Config["refresh-token"] = oidcTokens.RefreshToken
-			clientCmdAuthProvider.Config["idp-issuer-url"] = oidcIssuerVerifier.OIDCConfig().URL
-			clientCmdAuthProvider.Config["client-id"] = oidcIssuerVerifier.OIDCConfig().ClientID
-			clientCmdAuthProvider.Config["client-secret"] = oidcIssuerVerifier.OIDCConfig().ClientSecret
-			clientCmdAuth.AuthProvider = clientCmdAuthProvider
-			// Normalize email to lowercase to match how users are stored
-			email := strings.ToLower(claims.Email)
-			oidcKubeCfg.AuthInfos[email] = clientCmdAuth
-
-			// create default ctx
-			clientCmdCtx := clientcmdapi.NewContext()
-			clientCmdCtx.Cluster = req.ClusterID
-			clientCmdCtx.AuthInfo = email
-			oidcKubeCfg.Contexts[req.ClusterID] = clientCmdCtx
-			oidcKubeCfg.CurrentContext = req.ClusterID
+		clusterFromAdminKubeCfg := clusterFromAdminKubeconfig(adminKubeConfig, req.ClusterID, cluster.Status.Address.APIServerExternalAddress)
+		if clusterFromAdminKubeCfg == nil {
+			return nil, utilerrors.New(http.StatusInternalServerError, fmt.Sprintf("unable to construct kubeconfig because couldn't find %s cluster entry in existing kubecfg", req.ClusterID))
 		}
+
+		// Normalize email to lowercase to match how users are stored
+		email := strings.ToLower(claims.Email)
+		userEmailID := EncodeUserEmailToID(email)
+
+		oidcKubeCfg := buildWebTerminalKubeconfig(req.ClusterID, clusterFromAdminKubeCfg, email, oidcTokens.IDToken)
 
 		// prepare final rsp that holds kubeconfig
 		rsp := createOIDCKubeconfigRsp{}
@@ -556,9 +521,13 @@ func CreateOIDCKubeconfigSecretEndpoint(
 		if err != nil {
 			return nil, common.KubernetesErrorToHTTPError(err)
 		}
-		// Use lowercase email for secret name consistency
-		email := strings.ToLower(claims.Email)
-		if err := createKubeconfigSecret(ctx, client, oidcKubeCfg, email); err != nil {
+		if err := createKubeconfigSecret(ctx, client, oidcKubeCfg, email, userEmailID); err != nil {
+			return nil, common.KubernetesErrorToHTTPError(err)
+		}
+
+		// the refresh token stays in the seed, only the API uses it to renew the ID token
+		privilegedClusterProvider := ctx.Value(middleware.PrivilegedClusterProviderContextKey).(provider.PrivilegedClusterProvider)
+		if err := writeWebTerminalOIDCSecret(ctx, privilegedClusterProvider.GetSeedClusterAdminRuntimeClient(), cluster.Status.NamespaceName, userEmailID, email, oidcTokens.RefreshToken); err != nil {
 			return nil, common.KubernetesErrorToHTTPError(err)
 		}
 		return rsp, nil
@@ -602,11 +571,99 @@ func KubeconfigSecretName(userEmailID string) string {
 	return fmt.Sprintf("kubeconfig-%s", userEmailID)
 }
 
-func createKubeconfigSecret(ctx context.Context, client ctrlruntimeclient.Client, config *clientcmdapi.Config, email string) error {
-	// encode email address to unique ID for the secret name
+// WebTerminalOIDCRefreshTokenKey is the key of the refresh token in the seed Secret named by WebTerminalOIDCSecretName.
+const WebTerminalOIDCRefreshTokenKey = "refresh-token"
+
+// WebTerminalOIDCSecretName returns the name of the seed Secret, in the cluster namespace,
+// that holds the web terminal refresh token of a user.
+func WebTerminalOIDCSecretName(userEmailID string) string {
+	return fmt.Sprintf("webterminal-oidc-%s", userEmailID)
+}
+
+// EncodeUserEmailToID returns the ID used to name the web terminal resources of a user.
+// The email is lowercased, so all callers get the same ID whatever the case of the email claim.
+func EncodeUserEmailToID(email string) string {
 	hasher := md5.New()
-	hasher.Write([]byte(email))
-	kubeconfigSecretName := KubeconfigSecretName(hex.EncodeToString(hasher.Sum(nil)))
+	hasher.Write([]byte(strings.ToLower(email)))
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// clusterFromAdminKubeconfig returns a copy of the clusterID entry of the admin kubeconfig, with the
+// server replaced by the external address when one is set. It returns nil when there is no such entry.
+func clusterFromAdminKubeconfig(adminKubeConfig *clientcmdapi.Config, clusterID, externalAddress string) *clientcmdapi.Cluster {
+	configCluster, ok := adminKubeConfig.Clusters[clusterID]
+	if !ok || configCluster == nil {
+		return nil
+	}
+
+	c := configCluster.DeepCopy()
+	if externalAddress != "" {
+		c.Server = externalAddress
+	}
+	return c
+}
+
+// buildWebTerminalKubeconfig returns the kubeconfig stored in the user cluster for the web terminal.
+// It only carries the ID token. The refresh token and the OIDC client credentials never reach the user cluster.
+func buildWebTerminalKubeconfig(clusterID string, cluster *clientcmdapi.Cluster, email, idToken string) *clientcmdapi.Config {
+	cfg := clientcmdapi.NewConfig()
+
+	clientCmdCluster := clientcmdapi.NewCluster()
+	clientCmdCluster.Server = cluster.Server
+	clientCmdCluster.CertificateAuthorityData = cluster.CertificateAuthorityData
+	cfg.Clusters[clusterID] = clientCmdCluster
+
+	clientCmdAuth := clientcmdapi.NewAuthInfo()
+	clientCmdAuth.Token = idToken
+	cfg.AuthInfos[email] = clientCmdAuth
+
+	clientCmdCtx := clientcmdapi.NewContext()
+	clientCmdCtx.Cluster = clusterID
+	clientCmdCtx.AuthInfo = email
+	cfg.Contexts[clusterID] = clientCmdCtx
+	cfg.CurrentContext = clusterID
+
+	return cfg
+}
+
+// writeWebTerminalOIDCSecret creates or updates the seed Secret that holds the web terminal refresh token.
+func writeWebTerminalOIDCSecret(ctx context.Context, seedClient ctrlruntimeclient.Client, namespace, userEmailID, email, refreshToken string) error {
+	key := types.NamespacedName{Namespace: namespace, Name: WebTerminalOIDCSecretName(userEmailID)}
+
+	// a parallel login can create or change the Secret between our Get and write, so retry both cases
+	retriable := func(err error) bool {
+		return apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err)
+	}
+
+	return retry.OnError(retry.DefaultRetry, retriable, func() error {
+		secret := &corev1.Secret{}
+		if err := seedClient.Get(ctx, key, secret); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return fmt.Errorf("failed to get secret %v: %w", key, err)
+			}
+
+			secret = &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        key.Name,
+					Namespace:   key.Namespace,
+					Annotations: map[string]string{"user": email},
+				},
+				Type: corev1.SecretTypeOpaque,
+				Data: map[string][]byte{WebTerminalOIDCRefreshTokenKey: []byte(refreshToken)},
+			}
+			return seedClient.Create(ctx, secret)
+		}
+
+		if secret.Data == nil {
+			secret.Data = map[string][]byte{}
+		}
+		secret.Data[WebTerminalOIDCRefreshTokenKey] = []byte(refreshToken)
+		return seedClient.Update(ctx, secret)
+	})
+}
+
+func createKubeconfigSecret(ctx context.Context, client ctrlruntimeclient.Client, config *clientcmdapi.Config, email, userEmailID string) error {
+	kubeconfigSecretName := KubeconfigSecretName(userEmailID)
 	kubeconfig, err := clientcmd.Write(*config)
 	if err != nil {
 		return err

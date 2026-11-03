@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -107,10 +108,24 @@ func (o *OpenIDClient) Verify(ctx context.Context, token string) (authtypes.Toke
 		return authtypes.TokenClaims{}, err
 	}
 
+	// go-oidc accepts a token when ClientID is one of several audiences, so a token
+	// issued for the user clusters and the login client together would pass.
+	for _, aud := range idToken.Audience {
+		if slices.Contains(o.oidcConfig.RejectedAudiences, aud) {
+			return authtypes.TokenClaims{}, fmt.Errorf("oidc: audience %q is not accepted for this client", aud)
+		}
+	}
+
 	claims := map[string]interface{}{}
 	err = idToken.Claims(&claims)
 	if err != nil {
 		return authtypes.TokenClaims{}, err
+	}
+
+	// a token another client requested for this audience (Dex cross-client trust) names
+	// that client in azp
+	if azp, ok := claims["azp"].(string); ok && slices.Contains(o.oidcConfig.RejectedAudiences, azp) {
+		return authtypes.TokenClaims{}, fmt.Errorf("oidc: authorized party %q is not accepted for this client", azp)
 	}
 
 	oidcClaims := authtypes.TokenClaims{}
@@ -134,6 +149,14 @@ func (o *OpenIDClient) Verify(ctx context.Context, token string) (authtypes.Toke
 		if nonce, ok := rawNonce.(string); ok {
 			oidcClaims.Nonce = nonce
 		}
+	}
+	oidcClaims.Audience = idToken.Audience
+	switch v := claims["email_verified"].(type) {
+	case bool:
+		oidcClaims.EmailVerified = v
+	case string:
+		// some identity providers send the claim as a string
+		oidcClaims.EmailVerified = strings.EqualFold(v, "true")
 	}
 	if rawExp, found := claims["exp"]; found {
 		exp := rawExp.(float64)

@@ -6192,6 +6192,94 @@
         }
       }
     },
+    "/api/v2/admin/kubeconfig/tokens": {
+      "get": {
+        "description": "Admin only.",
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "admin"
+        ],
+        "summary": "Lists kubeconfig tokens of all users, optionally filtered by cluster or user.",
+        "operationId": "listAllKubeconfigTokens",
+        "parameters": [
+          {
+            "type": "string",
+            "x-go-name": "ClusterID",
+            "name": "cluster_id",
+            "in": "query"
+          },
+          {
+            "type": "string",
+            "x-go-name": "UserID",
+            "name": "user_id",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "KubeconfigToken",
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/KubeconfigToken"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/responses/empty"
+          },
+          "403": {
+            "$ref": "#/responses/empty"
+          },
+          "default": {
+            "description": "errorResponse",
+            "schema": {
+              "$ref": "#/definitions/errorResponse"
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/admin/kubeconfig/tokens/{token_id}": {
+      "delete": {
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "admin"
+        ],
+        "summary": "Revokes any kubeconfig token by its ID. Admin only.",
+        "operationId": "revokeAnyKubeconfigToken",
+        "parameters": [
+          {
+            "type": "string",
+            "x-go-name": "TokenID",
+            "name": "token_id",
+            "in": "path",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/responses/empty"
+          },
+          "401": {
+            "$ref": "#/responses/empty"
+          },
+          "403": {
+            "$ref": "#/responses/empty"
+          },
+          "default": {
+            "description": "errorResponse",
+            "schema": {
+              "$ref": "#/definitions/errorResponse"
+            }
+          }
+        }
+      }
+    },
     "/api/v2/allowedregistries": {
       "get": {
         "produces": [
@@ -6671,6 +6759,49 @@
           },
           "403": {
             "$ref": "#/responses/empty"
+          },
+          "default": {
+            "description": "errorResponse",
+            "schema": {
+              "$ref": "#/definitions/errorResponse"
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/clusters/{cluster_id}/kubeconfig/token": {
+      "get": {
+        "description": "The identity provider redirects back to this path with an authorization code;\nthe response is then the one-time token and kubeconfig. This endpoint exists\nonly when per-cluster kubeconfig tokens are enabled and the dashboard login\nuses its own OIDC client.",
+        "produces": [
+          "application/json",
+          "text/html"
+        ],
+        "tags": [
+          "userclustertoken"
+        ],
+        "summary": "Starts the OIDC login for exporting a kubeconfig token for the given cluster.",
+        "operationId": "exportKubeconfigToken",
+        "parameters": [
+          {
+            "type": "string",
+            "x-go-name": "ClusterID",
+            "name": "cluster_id",
+            "in": "path",
+            "required": true
+          },
+          {
+            "type": "string",
+            "x-go-name": "Lifetime",
+            "name": "lifetime",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "KubeconfigTokenExport",
+            "schema": {
+              "$ref": "#/definitions/KubeconfigTokenExport"
+            }
           },
           "default": {
             "description": "errorResponse",
@@ -10963,6 +11094,223 @@
         "responses": {
           "200": {
             "$ref": "#/responses/Kubeconfig"
+          },
+          "401": {
+            "$ref": "#/responses/empty"
+          },
+          "403": {
+            "$ref": "#/responses/empty"
+          },
+          "default": {
+            "description": "errorResponse",
+            "schema": {
+              "$ref": "#/definitions/errorResponse"
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/projects/{project_id}/clusters/{cluster_id}/kubeconfig/tokens": {
+      "get": {
+        "description": "The response never contains a token secret or its hash.",
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "userclustertoken"
+        ],
+        "summary": "Lists the kubeconfig tokens of the authenticated user for the given cluster.",
+        "operationId": "listKubeconfigTokens",
+        "parameters": [
+          {
+            "type": "string",
+            "x-go-name": "ProjectID",
+            "name": "project_id",
+            "in": "path",
+            "required": true
+          },
+          {
+            "type": "string",
+            "x-go-name": "ClusterID",
+            "name": "cluster_id",
+            "in": "path",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "KubeconfigToken",
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/KubeconfigToken"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/responses/empty"
+          },
+          "403": {
+            "$ref": "#/responses/empty"
+          },
+          "default": {
+            "description": "errorResponse",
+            "schema": {
+              "$ref": "#/definitions/errorResponse"
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/projects/{project_id}/clusters/{cluster_id}/kubeconfig/tokens/settings": {
+      "get": {
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "userclustertoken"
+        ],
+        "summary": "Returns the lifetime rules for new kubeconfig tokens of the given cluster.",
+        "operationId": "getKubeconfigTokenSettings",
+        "parameters": [
+          {
+            "type": "string",
+            "x-go-name": "ProjectID",
+            "name": "project_id",
+            "in": "path",
+            "required": true
+          },
+          {
+            "type": "string",
+            "x-go-name": "ClusterID",
+            "name": "cluster_id",
+            "in": "path",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "KubeconfigTokenSettings",
+            "schema": {
+              "$ref": "#/definitions/KubeconfigTokenSettings"
+            }
+          },
+          "401": {
+            "$ref": "#/responses/empty"
+          },
+          "403": {
+            "$ref": "#/responses/empty"
+          },
+          "default": {
+            "description": "errorResponse",
+            "schema": {
+              "$ref": "#/definitions/errorResponse"
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/projects/{project_id}/clusters/{cluster_id}/kubeconfig/tokens/{token_id}": {
+      "delete": {
+        "description": "The cluster rejects the token within the webhook cache TTL afterwards.",
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "userclustertoken"
+        ],
+        "summary": "Revokes one of the authenticated user's kubeconfig tokens for the given cluster.",
+        "operationId": "revokeKubeconfigToken",
+        "parameters": [
+          {
+            "type": "string",
+            "x-go-name": "ProjectID",
+            "name": "project_id",
+            "in": "path",
+            "required": true
+          },
+          {
+            "type": "string",
+            "x-go-name": "ClusterID",
+            "name": "cluster_id",
+            "in": "path",
+            "required": true
+          },
+          {
+            "type": "string",
+            "x-go-name": "TokenID",
+            "name": "token_id",
+            "in": "path",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/responses/empty"
+          },
+          "401": {
+            "$ref": "#/responses/empty"
+          },
+          "403": {
+            "$ref": "#/responses/empty"
+          },
+          "default": {
+            "description": "errorResponse",
+            "schema": {
+              "$ref": "#/definitions/errorResponse"
+            }
+          }
+        }
+      },
+      "patch": {
+        "description": "Updates the label of one of the authenticated user's kubeconfig tokens for the\ngiven cluster.",
+        "consumes": [
+          "application/json"
+        ],
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "userclustertoken"
+        ],
+        "operationId": "patchKubeconfigToken",
+        "parameters": [
+          {
+            "type": "string",
+            "x-go-name": "ProjectID",
+            "name": "project_id",
+            "in": "path",
+            "required": true
+          },
+          {
+            "type": "string",
+            "x-go-name": "ClusterID",
+            "name": "cluster_id",
+            "in": "path",
+            "required": true
+          },
+          {
+            "type": "string",
+            "x-go-name": "TokenID",
+            "name": "token_id",
+            "in": "path",
+            "required": true
+          },
+          {
+            "x-go-name": "Body",
+            "name": "body",
+            "in": "body",
+            "schema": {
+              "$ref": "#/definitions/KubeconfigTokenPatch"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "KubeconfigToken",
+            "schema": {
+              "$ref": "#/definitions/KubeconfigToken"
+            }
           },
           "401": {
             "$ref": "#/responses/empty"
@@ -36660,6 +37008,134 @@
       "description": "KubeVirtVolumeProvisioner represents what is the provisioner of the storage class volume, whether it will be the csi driver\nand/or CDI for disk images.",
       "type": "string",
       "x-go-package": "k8c.io/kubermatic/sdk/v2/apis/kubermatic/v1"
+    },
+    "KubeconfigToken": {
+      "description": "KubeconfigToken describes one kubeconfig token issued for a user cluster. It never\ncontains the token secret or its hash.",
+      "type": "object",
+      "properties": {
+        "clusterID": {
+          "description": "ClusterID is the ID of the cluster the token is valid for.",
+          "type": "string",
+          "x-go-name": "ClusterID"
+        },
+        "expirationTime": {
+          "description": "ExpirationTime is when the token stops working.",
+          "type": "string",
+          "x-go-name": "ExpirationTime"
+        },
+        "id": {
+          "description": "ID is the token ID, the part between the cluster ID and the colon in the token value.",
+          "type": "string",
+          "x-go-name": "ID"
+        },
+        "issueTime": {
+          "description": "IssueTime is when the token was issued.",
+          "type": "string",
+          "x-go-name": "IssueTime"
+        },
+        "label": {
+          "description": "Label is the name the owner gave the token.",
+          "type": "string",
+          "x-go-name": "Label"
+        },
+        "lastUsedTime": {
+          "description": "LastUsedTime is the last time the cluster accepted the token, written at most every few minutes.",
+          "type": "string",
+          "x-go-name": "LastUsedTime"
+        },
+        "reason": {
+          "description": "Reason explains a Disabled state.",
+          "type": "string",
+          "x-go-name": "Reason"
+        },
+        "state": {
+          "description": "State is \"Active\" or \"Disabled\" as seen on the seed; empty when not known yet.",
+          "type": "string",
+          "x-go-name": "State"
+        },
+        "userEmail": {
+          "description": "UserEmail is the email of the token owner.",
+          "type": "string",
+          "x-go-name": "UserEmail"
+        },
+        "userID": {
+          "description": "UserID is the KKP user ID of the token owner.",
+          "type": "string",
+          "x-go-name": "UserID"
+        }
+      },
+      "x-go-package": "k8c.io/dashboard/v2/pkg/api/v2"
+    },
+    "KubeconfigTokenExport": {
+      "type": "object",
+      "title": "ExportResponse is the one-time answer of a completed export.",
+      "properties": {
+        "expirationTime": {
+          "description": "ExpirationTime is when the token stops working.",
+          "type": "string",
+          "x-go-name": "ExpirationTime"
+        },
+        "kubeconfig": {
+          "description": "Kubeconfig is the ready-to-save kubeconfig file for the cluster.",
+          "type": "string",
+          "x-go-name": "Kubeconfig"
+        },
+        "settings": {
+          "$ref": "#/definitions/KubeconfigTokenSettings"
+        },
+        "token": {
+          "description": "Token is the full token value. It is shown once and never stored by KKP.",
+          "type": "string",
+          "x-go-name": "Token"
+        },
+        "tokenID": {
+          "description": "TokenID is the ID of the token, safe to display and log.",
+          "type": "string",
+          "x-go-name": "TokenID"
+        }
+      },
+      "x-go-name": "ExportResponse",
+      "x-go-package": "k8c.io/dashboard/v2/pkg/handler/v2/userclustertoken"
+    },
+    "KubeconfigTokenPatch": {
+      "type": "object",
+      "title": "KubeconfigTokenPatch holds the fields of a kubeconfig token a user may change.",
+      "properties": {
+        "label": {
+          "description": "Label is the new name of the token, at most 128 characters.",
+          "type": "string",
+          "x-go-name": "Label"
+        }
+      },
+      "x-go-package": "k8c.io/dashboard/v2/pkg/api/v2"
+    },
+    "KubeconfigTokenSettings": {
+      "type": "object",
+      "title": "KubeconfigTokenSettings describes the lifetime rules for new kubeconfig tokens.",
+      "properties": {
+        "defaultLifetime": {
+          "description": "DefaultLifetime is the lifetime of a new token when the export request names none, as a Go duration.",
+          "type": "string",
+          "x-go-name": "DefaultLifetime"
+        },
+        "idleTimeout": {
+          "description": "IdleTimeout is how long a token may stay unused before the cluster rejects it, as a Go duration.",
+          "type": "string",
+          "x-go-name": "IdleTimeout"
+        },
+        "maxActivePerUserPerCluster": {
+          "description": "MaxActivePerUserPerCluster is how many unexpired tokens one user may hold for one cluster.",
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "MaxActivePerUserPerCluster"
+        },
+        "maxLifetime": {
+          "description": "MaxLifetime is the longest lifetime an export request may ask for, as a Go duration.",
+          "type": "string",
+          "x-go-name": "MaxLifetime"
+        }
+      },
+      "x-go-package": "k8c.io/dashboard/v2/pkg/api/v2"
     },
     "KubermaticVersions": {
       "type": "object",

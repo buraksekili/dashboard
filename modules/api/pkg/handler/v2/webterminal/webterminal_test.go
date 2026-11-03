@@ -17,6 +17,7 @@ limitations under the License.
 package webterminal_test
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -36,6 +37,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -256,6 +258,34 @@ func TestCreateOIDCKubeconfig(t *testing.T) {
 
 				// validate
 				assert.Equal(t, tc.ExpectedExchangeCodePhase.HTTPStatus, res.Code)
+
+				// the refresh token is kept in the seed cluster namespace, not in the user cluster
+				if res.Code == http.StatusOK {
+					seedSecret := &corev1.Secret{}
+					key := types.NamespacedName{
+						Namespace: kubernetes.NamespaceName(tc.ClusterID),
+						Name:      handlercommon.WebTerminalOIDCSecretName(handlercommon.EncodeUserEmailToID(tc.ExistingAPIUser.Email)),
+					}
+					if err := clients.FakeSeedClient.Get(context.Background(), key, seedSecret); err != nil {
+						t.Fatalf("expected seed secret %v: %v", key, err)
+					}
+					assert.NotEmpty(t, seedSecret.Data[handlercommon.WebTerminalOIDCRefreshTokenKey])
+
+					// the fake user cluster client is backed by the seed client
+					userSecret := &corev1.Secret{}
+					userKey := types.NamespacedName{
+						Namespace: metav1.NamespaceSystem,
+						Name:      handlercommon.KubeconfigSecretName(handlercommon.EncodeUserEmailToID(tc.ExistingAPIUser.Email)),
+					}
+					if err := clients.FakeSeedClient.Get(context.Background(), userKey, userSecret); err != nil {
+						t.Fatalf("expected user cluster secret %v: %v", userKey, err)
+					}
+					kubeconfig := string(userSecret.Data["kubeconfig"])
+					assert.Contains(t, kubeconfig, "token: ")
+					for _, forbidden := range []string{"refresh-token", "client-secret", "client-id", "auth-provider"} {
+						assert.NotContains(t, kubeconfig, forbidden)
+					}
+				}
 			}
 		})
 	}

@@ -18,9 +18,7 @@ package websocket
 
 import (
 	"context"
-	"crypto/md5"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,6 +49,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/kubectl/pkg/scheme"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -71,6 +70,8 @@ const (
 	pingInterval                      = 30 * time.Second
 	pingMessage                       = "PING"
 	pongMessage                       = "PONG"
+
+	kubeconfigSecretNameEnv = "KUBECONFIG_SECRET_NAME"
 
 	webTerminalImage                   = resources.WEBTerminalImage
 	webTerminalContainerKubeconfigPath = "/etc/kubernetes/kubeconfig/kubeconfig"
@@ -270,9 +271,11 @@ func getWebTerminalExpirationValues(ctx context.Context, clusterClient ctrlrunti
 	return expirationTime, expirationRefreshes, nil
 }
 
-func pingRoutine(websocketConn *websocket.Conn) {
+func pingRoutine(ctx context.Context, websocketConn *websocket.Conn) {
 	for {
-		time.Sleep(pingInterval)
+		if !sleepCtx(ctx, pingInterval) {
+			return
+		}
 		// Message to check if connection with client is active.
 		if err := SendMessage(websocketConn, pingMessage); err != nil {
 			// connection is already closed, so just return
@@ -281,7 +284,33 @@ func pingRoutine(websocketConn *websocket.Conn) {
 	}
 }
 
-func checkTokenAndRefreshIfNeeded(ctx context.Context, clusterClient ctrlruntimeclient.Client, oidcIssuerVerifier authtypes.OIDCIssuerVerifier, kubeconfigSecret *corev1.Secret, websocketConn *websocket.Conn) {
+// jsonWriter is the part of the websocket connection used to send status messages.
+type jsonWriter interface {
+	WriteJSON(v interface{}) error
+}
+
+// sleepCtx waits for d and returns false if ctx is done first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// checkTokenAndRefreshIfNeeded keeps the ID token in the user cluster kubeconfig Secret fresh while the
+// terminal session is open. The refresh token is read from and written back to a Secret in the seed
+// cluster namespace, so it never reaches the user cluster.
+func checkTokenAndRefreshIfNeeded(ctx context.Context, clusterClient, seedClient ctrlruntimeclient.Client, clusterNamespace, userEmailID string, oidcIssuerVerifier authtypes.OIDCIssuerVerifier, kubeconfigSecret *corev1.Secret, websocketConn jsonWriter) {
+	seedSecretKey := ctrlruntimeclient.ObjectKey{
+		Namespace: clusterNamespace,
+		Name:      handlercommon.WebTerminalOIDCSecretName(userEmailID),
+	}
+
 	for {
 		// Update the kubeconfig secret in case it gets recreated.
 		if err := clusterClient.Get(ctx, ctrlruntimeclient.ObjectKey{
@@ -290,14 +319,18 @@ func checkTokenAndRefreshIfNeeded(ctx context.Context, clusterClient ctrlruntime
 		}, kubeconfigSecret); err != nil {
 			log.Logger.Debug(err)
 			_ = SendMessage(websocketConn, string(KubeconfigSecretMissing))
-			time.Sleep(5 * time.Second)
+			if !sleepCtx(ctx, 5*time.Second) {
+				return
+			}
 			continue
 		}
 		cfg, err := clientcmd.Load(kubeconfigSecret.Data["kubeconfig"])
 		if err != nil {
 			log.Logger.Debug(err)
 			_ = SendMessage(websocketConn, string(KubeconfigSecretInvalid))
-			time.Sleep(5 * time.Second)
+			if !sleepCtx(ctx, 5*time.Second) {
+				return
+			}
 			continue
 		}
 
@@ -305,64 +338,110 @@ func checkTokenAndRefreshIfNeeded(ctx context.Context, clusterClient ctrlruntime
 		if err != nil {
 			log.Logger.Debug(err)
 			_ = SendMessage(websocketConn, string(KubeconfigSecretInvalid))
-			time.Sleep(5 * time.Second)
+			if !sleepCtx(ctx, 5*time.Second) {
+				return
+			}
 			continue
 		}
 
-		tokenExpirationTime, err := GetTokenExpiration(user.AuthProvider.Config["id-token"])
+		// kubeconfigs written before the refresh token moved to the seed still hold the refresh token and
+		// the client secret. Delete them, the UI then runs the login popup again which writes the new format.
+		if user.AuthProvider != nil {
+			if err := clusterClient.Delete(ctx, kubeconfigSecret); ctrlruntimeclient.IgnoreNotFound(err) != nil {
+				log.Logger.Debug(err)
+			}
+			_ = SendMessage(websocketConn, string(KubeconfigSecretMissing))
+			if !sleepCtx(ctx, 5*time.Second) {
+				return
+			}
+			continue
+		}
+
+		tokenExpirationTime, err := GetTokenExpiration(user.Token)
 		if err != nil {
 			log.Logger.Debug(err)
-			onFailedUpdatingToken(websocketConn, tokenExpirationTime)
+			if !onFailedUpdatingToken(ctx, websocketConn, tokenExpirationTime) {
+				return
+			}
 			continue
 		}
 
 		// Only refresh the token when it’s close to expiring.
-		if time.Until(tokenExpirationTime) <= remainingTokenExpirationTime {
-			refreshToken := user.AuthProvider.Config["refresh-token"]
-
-			newToken, err := oidcIssuerVerifier.RefreshAccessToken(ctx, refreshToken)
+		threshold := tokenRefreshThreshold(user.Token)
+		if time.Until(tokenExpirationTime) <= threshold {
+			tokenExpirationTime, err = refreshToken(ctx, clusterClient, seedClient, seedSecretKey, oidcIssuerVerifier, kubeconfigSecret, cfg, user)
 			if err != nil {
 				log.Logger.Debug(err)
-				onFailedUpdatingToken(websocketConn, tokenExpirationTime)
+				if !onFailedUpdatingToken(ctx, websocketConn, tokenExpirationTime) {
+					return
+				}
 				continue
 			}
-
-			user.AuthProvider.Config["id-token"] = newToken.IDToken
-			user.AuthProvider.Config["refresh-token"] = newToken.RefreshToken
-			updatedKubeconfig, err := clientcmd.Write(*cfg)
-			if err != nil {
-				log.Logger.Debug(err)
-				onFailedUpdatingToken(websocketConn, tokenExpirationTime)
-				continue
-			}
-			kubeconfigSecret.Data["kubeconfig"] = updatedKubeconfig
-			if err := clusterClient.Update(ctx, kubeconfigSecret); err != nil {
-				log.Logger.Debug(err)
-				onFailedUpdatingToken(websocketConn, tokenExpirationTime)
-				continue
-			}
-			tokenExpirationTime, err = GetTokenExpiration(user.AuthProvider.Config["id-token"])
-			if err != nil {
-				log.Logger.Debug(err)
-				onFailedUpdatingToken(websocketConn, tokenExpirationTime)
-				continue
-			}
+			threshold = tokenRefreshThreshold(user.Token)
 		}
 
-		// check again 5 min before the token expiration or at the token expiration time
+		// check again when the token reaches the refresh threshold or at the token expiration time
 		_ = SendMessage(websocketConn, string(WebTerminalTokenValid))
-		sleepDuration := time.Until(tokenExpirationTime) - remainingTokenExpirationTime
-		if sleepDuration > 0 {
-			time.Sleep(sleepDuration)
-		} else {
-			time.Sleep(time.Until(tokenExpirationTime))
+		sleepDuration := time.Until(tokenExpirationTime) - threshold
+		if sleepDuration <= 0 {
+			sleepDuration = time.Until(tokenExpirationTime)
+		}
+		if !sleepCtx(ctx, sleepDuration) {
+			return
 		}
 	}
 }
 
+// refreshToken renews the ID token with the refresh token from the seed Secret. It stores the new
+// refresh token in the seed Secret first, so a failed user cluster update does not lose a rotated
+// refresh token. It returns the expiry of the token that is in the kubeconfig afterwards.
+func refreshToken(ctx context.Context, clusterClient, seedClient ctrlruntimeclient.Client, seedSecretKey ctrlruntimeclient.ObjectKey, oidcIssuerVerifier authtypes.OIDCIssuerVerifier, kubeconfigSecret *corev1.Secret, cfg *clientcmdapi.Config, user *clientcmdapi.AuthInfo) (time.Time, error) {
+	currentExpiration, _ := GetTokenExpiration(user.Token)
+
+	seedSecret := &corev1.Secret{}
+	if err := seedClient.Get(ctx, seedSecretKey, seedSecret); err != nil {
+		return currentExpiration, fmt.Errorf("failed to get refresh token secret: %w", err)
+	}
+	oldRefreshToken := string(seedSecret.Data[handlercommon.WebTerminalOIDCRefreshTokenKey])
+	if oldRefreshToken == "" {
+		return currentExpiration, errors.New("refresh token secret has no refresh token")
+	}
+
+	newToken, err := oidcIssuerVerifier.RefreshAccessToken(ctx, oldRefreshToken)
+	if err != nil {
+		return currentExpiration, err
+	}
+
+	newExpiration, err := GetTokenExpiration(newToken.IDToken)
+	if err != nil {
+		return currentExpiration, err
+	}
+
+	if newToken.RefreshToken != "" && newToken.RefreshToken != oldRefreshToken {
+		seedSecret.Data[handlercommon.WebTerminalOIDCRefreshTokenKey] = []byte(newToken.RefreshToken)
+		if err := seedClient.Update(ctx, seedSecret); err != nil {
+			return currentExpiration, fmt.Errorf("failed to store refresh token: %w", err)
+		}
+	}
+
+	user.Token = newToken.IDToken
+	updatedKubeconfig, err := clientcmd.Write(*cfg)
+	if err != nil {
+		return currentExpiration, err
+	}
+	kubeconfigSecret.Data["kubeconfig"] = updatedKubeconfig
+	if err := clusterClient.Update(ctx, kubeconfigSecret); err != nil {
+		return currentExpiration, err
+	}
+
+	return newExpiration, nil
+}
+
 func expirationCheckRoutine(ctx context.Context, clusterClient ctrlruntimeclient.Client, userEmailID string, websocketConn *websocket.Conn) {
 	for {
-		time.Sleep(expirationCheckInterval)
+		if !sleepCtx(ctx, expirationCheckInterval) {
+			return
+		}
 
 		expirationTime, numberOfRefreshes, err := getWebTerminalExpirationValues(ctx, clusterClient, userEmailID)
 		if err != nil {
@@ -390,30 +469,8 @@ func expirationCheckRoutine(ctx context.Context, clusterClient ctrlruntimeclient
 // Executed cmd in the container specified in request and connects it up with the ptyHandler (a session).
 func startProcess(ctx context.Context, client, seedClient ctrlruntimeclient.Client, k8sClient kubernetes.Interface, cfg *rest.Config, userEmailID string, cluster *kubermaticv1.Cluster, options *kubermaticv1.WebTerminalOptions, oidcIssuerVerifier authtypes.OIDCIssuerVerifier, kubeconfigSecret *corev1.Secret, overwriteRegistry string, cmd []string, ptyHandler PtyHandler, websocketConn *websocket.Conn) error {
 	userAppName := userAppName(userEmailID)
-	// check if WEB terminal Pod exists, if not create
-	pod := &corev1.Pod{}
-	if err := client.Get(ctx, ctrlruntimeclient.ObjectKey{
-		Namespace: metav1.NamespaceSystem,
-		Name:      userAppName,
-	}, pod); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return err
-		}
-		// create NetworkPolicy, Pod and cleanup Job
-		if err := createOrUpdateResources(ctx, client, seedClient, userEmailID, userAppName, cluster, options, overwriteRegistry); err != nil {
-			return err
-		}
-	}
-
-	// create or update ConfigMap to renew expiration time
-	if err := client.Create(ctx, genWebTerminalConfigMap(userAppName, 0)); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return err
-		}
-		err := client.Update(ctx, genWebTerminalConfigMap(userAppName, 0))
-		if err != nil {
-			return err
-		}
+	if err := prepareResources(ctx, client, seedClient, userEmailID, userAppName, cluster, options, overwriteRegistry); err != nil {
+		return err
 	}
 
 	if !WaitFor(ctx, 5*time.Second, timeout, func(ctx context.Context) bool {
@@ -443,11 +500,11 @@ func startProcess(ctx context.Context, client, seedClient ctrlruntimeclient.Clie
 		return fmt.Errorf("the WEB terminal Pod is not ready")
 	}
 
-	go pingRoutine(websocketConn)
+	go pingRoutine(ctx, websocketConn)
 
 	go expirationCheckRoutine(ctx, client, userEmailID, websocketConn)
 
-	go checkTokenAndRefreshIfNeeded(ctx, client, oidcIssuerVerifier, kubeconfigSecret, websocketConn)
+	go checkTokenAndRefreshIfNeeded(ctx, client, seedClient, cluster.Status.NamespaceName, userEmailID, oidcIssuerVerifier, kubeconfigSecret, websocketConn)
 
 	req := k8sClient.CoreV1().RESTClient().Post().
 		Resource("pods").
@@ -482,7 +539,45 @@ func startProcess(ctx context.Context, client, seedClient ctrlruntimeclient.Clie
 	return nil
 }
 
-func createOrUpdateResources(ctx context.Context, client, seedClient ctrlruntimeclient.Client, userEmailID, userAppName string, cluster *kubermaticv1.Cluster, options *kubermaticv1.WebTerminalOptions, overwriteRegistry string) error {
+// prepareResources creates the user cluster resources of the web terminal when its pod is missing,
+// makes sure the cleanup Job exists and renews the expiration ConfigMap.
+func prepareResources(ctx context.Context, client, seedClient ctrlruntimeclient.Client, userEmailID, userAppName string, cluster *kubermaticv1.Cluster, options *kubermaticv1.WebTerminalOptions, overwriteRegistry string) error {
+	// check if WEB terminal Pod exists, if not create
+	pod := &corev1.Pod{}
+	if err := client.Get(ctx, ctrlruntimeclient.ObjectKey{
+		Namespace: metav1.NamespaceSystem,
+		Name:      userAppName,
+	}, pod); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		// create NetworkPolicy and Pod
+		if err := createOrUpdateResources(ctx, client, userEmailID, userAppName, cluster, options, overwriteRegistry); err != nil {
+			return err
+		}
+	}
+
+	// the job can be gone while the pod still exists, e.g. when the pod is still terminating,
+	// so check it on every session
+	if err := ensureCleanupJob(ctx, seedClient, userEmailID, userAppName, cluster.Status.NamespaceName, overwriteRegistry); err != nil {
+		return err
+	}
+
+	// create or update ConfigMap to renew expiration time
+	if err := client.Create(ctx, genWebTerminalConfigMap(userAppName, 0)); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		err := client.Update(ctx, genWebTerminalConfigMap(userAppName, 0))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func createOrUpdateResources(ctx context.Context, client ctrlruntimeclient.Client, userEmailID, userAppName string, cluster *kubermaticv1.Cluster, options *kubermaticv1.WebTerminalOptions, overwriteRegistry string) error {
 	webTerminalNetworkPolicy, err := genWebTerminalNetworkPolicy(userAppName, cluster, options)
 	if err != nil {
 		return err
@@ -503,13 +598,107 @@ func createOrUpdateResources(ctx context.Context, client, seedClient ctrlruntime
 		}
 	}
 
-	if err := seedClient.Create(ctx, genWebTerminalCleanupJob(userAppName, userEmailID, cluster.Name, overwriteRegistry)); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
+	return nil
+}
+
+// ensureCleanupJob creates the cleanup Job in the seed when it is missing, replaces a Job created
+// before the upgrade whose script does not delete the kubeconfig Secret, and makes the Job the owner
+// of the seed Secret with the refresh token.
+func ensureCleanupJob(ctx context.Context, seedClient ctrlruntimeclient.Client, userEmailID, userAppName, clusterNamespace, overwriteRegistry string) error {
+	cleanupJob := genWebTerminalCleanupJob(userAppName, userEmailID, clusterNamespace, overwriteRegistry)
+	key := ctrlruntimeclient.ObjectKeyFromObject(cleanupJob)
+
+	existing := &batchv1.Job{}
+	err := seedClient.Get(ctx, key, existing)
+	switch {
+	case err == nil && !cleanupJobDeletesKubeconfigSecret(existing):
+		if err := seedClient.Delete(ctx, existing, ctrlruntimeclient.PropagationPolicy(metav1.DeletePropagationBackground)); ctrlruntimeclient.IgnoreNotFound(err) != nil {
 			return err
 		}
+		// wait until the old job is gone, otherwise the create below finds it and the Secret gets the old owner
+		if !WaitFor(ctx, time.Second, 30*time.Second, func(ctx context.Context) bool {
+			return apierrors.IsNotFound(seedClient.Get(ctx, key, &batchv1.Job{}))
+		}) {
+			return fmt.Errorf("timed out waiting for the old cleanup job %v to be deleted", key)
+		}
+		if err := createJob(ctx, seedClient, cleanupJob); err != nil {
+			return err
+		}
+	case apierrors.IsNotFound(err):
+		if err := createJob(ctx, seedClient, cleanupJob); err != nil {
+			return err
+		}
+	case err != nil:
+		return err
 	}
 
+	// read the job back, the UID is needed for the owner reference
+	if err := seedClient.Get(ctx, key, cleanupJob); err != nil {
+		return err
+	}
+
+	return setWebTerminalOIDCSecretOwner(ctx, seedClient, userEmailID, cleanupJob)
+}
+
+func createJob(ctx context.Context, seedClient ctrlruntimeclient.Client, job *batchv1.Job) error {
+	if err := seedClient.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
 	return nil
+}
+
+// cleanupJobDeletesKubeconfigSecret reports whether the job runs the current cleanup script, which also
+// deletes the kubeconfig Secret. Jobs created by older versions do not have the KUBECONFIG_SECRET_NAME env.
+func cleanupJobDeletesKubeconfigSecret(job *batchv1.Job) bool {
+	for _, c := range job.Spec.Template.Spec.Containers {
+		for _, e := range c.Env {
+			if e.Name == kubeconfigSecretNameEnv {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// setWebTerminalOIDCSecretOwner makes the cleanup Job the owner of the seed Secret that holds the
+// refresh token, so garbage collection deletes the Secret together with the Job. It does nothing
+// when the Secret does not exist.
+func setWebTerminalOIDCSecretOwner(ctx context.Context, seedClient ctrlruntimeclient.Client, userEmailID string, job *batchv1.Job) error {
+	key := ctrlruntimeclient.ObjectKey{
+		Namespace: job.Namespace,
+		Name:      handlercommon.WebTerminalOIDCSecretName(userEmailID),
+	}
+	ownerRef := metav1.OwnerReference{
+		APIVersion:         batchv1.SchemeGroupVersion.String(),
+		Kind:               "Job",
+		Name:               job.Name,
+		UID:                job.UID,
+		Controller:         resources.Bool(false),
+		BlockOwnerDeletion: resources.Bool(false),
+	}
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		secret := &corev1.Secret{}
+		if err := seedClient.Get(ctx, key, secret); err != nil {
+			return ctrlruntimeclient.IgnoreNotFound(err)
+		}
+
+		// drop references to earlier jobs with the same name, they are already gone
+		refs := []metav1.OwnerReference{}
+		for _, ref := range secret.OwnerReferences {
+			if ref.UID == job.UID {
+				return nil
+			}
+			if ref.Kind == ownerRef.Kind && ref.Name == ownerRef.Name {
+				continue
+			}
+			refs = append(refs, ref)
+		}
+		refs = append(refs, ownerRef)
+		secret.OwnerReferences = refs
+
+		return seedClient.Update(ctx, secret)
+	})
 }
 
 func genWebTerminalConfigMap(userAppName string, numberOfExpirationRefreshes int) *corev1.ConfigMap {
@@ -669,8 +858,7 @@ func genWebTerminalPod(userAppName, userEmailID string, options *kubermaticv1.We
 	return pod
 }
 
-func genWebTerminalCleanupJob(userAppName, userEmailID string, clusterID string, overwriteRegistry string) *batchv1.Job {
-	namespace := fmt.Sprintf("cluster-%s", clusterID)
+func genWebTerminalCleanupJob(userAppName, userEmailID, namespace, overwriteRegistry string) *batchv1.Job {
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("cleanup-%s", userAppName),
@@ -703,10 +891,14 @@ func genWebTerminalCleanupJob(userAppName, userEmailID string, clusterID string,
 									sleep $REMAINING_TIME_SEC;
 									exit 1; # exit as failed, so the job will be restarted to check if the expiration was updated
 								fi
-								# user web terminal is already expired, so delete its resources
-								kubectl delete networkpolicy $USER_APP_NAME -n $NAMESPACE_SYSTEM;
-								kubectl delete configmap $USER_APP_NAME -n $NAMESPACE_SYSTEM;
-								kubectl delete pod $USER_APP_NAME -n $NAMESPACE_SYSTEM;`,
+								# user web terminal is already expired, so delete its resources.
+								# run every delete, but fail the job if any of them failed, so it gets retried
+								rc=0
+								kubectl delete secret $KUBECONFIG_SECRET_NAME -n $NAMESPACE_SYSTEM --ignore-not-found || rc=1
+								kubectl delete networkpolicy $USER_APP_NAME -n $NAMESPACE_SYSTEM --ignore-not-found || rc=1
+								kubectl delete configmap $USER_APP_NAME -n $NAMESPACE_SYSTEM --ignore-not-found || rc=1
+								kubectl delete pod $USER_APP_NAME -n $NAMESPACE_SYSTEM --ignore-not-found || rc=1
+								exit $rc`,
 							},
 							Env: []corev1.EnvVar{
 								{
@@ -720,6 +912,10 @@ func genWebTerminalCleanupJob(userAppName, userEmailID string, clusterID string,
 								{
 									Name:  "NAMESPACE_SYSTEM",
 									Value: metav1.NamespaceSystem,
+								},
+								{
+									Name:  kubeconfigSecretNameEnv,
+									Value: handlercommon.KubeconfigSecretName(userEmailID),
 								},
 								{
 									Name:  "MAX_EXPIRATION_REFRESHES",
@@ -877,10 +1073,10 @@ func Terminal(ctx context.Context, ws *websocket.Conn, client, seedClient ctrlru
 	}
 }
 
+// EncodeUserEmailtoID returns the ID used to name the web terminal resources of a user.
+// It ignores the case of the email, see handlercommon.EncodeUserEmailToID.
 func EncodeUserEmailtoID(email string) string {
-	hasher := md5.New()
-	hasher.Write([]byte(email))
-	return hex.EncodeToString(hasher.Sum(nil))
+	return handlercommon.EncodeUserEmailToID(email)
 }
 
 // WaitFor is a function to wait until callback function return true.
@@ -893,7 +1089,7 @@ func WaitFor(ctx context.Context, interval time.Duration, timeout time.Duration,
 
 // SendMessage sends TerminalMessage to the client. It usually contains a context related
 // to the status of background tasks responsible for setting up the terminal.
-func SendMessage(wsConn *websocket.Conn, message string) error {
+func SendMessage(wsConn jsonWriter, message string) error {
 	return wsConn.WriteJSON(TerminalMessage{
 		Op:   "msg",
 		Data: message,
@@ -908,20 +1104,60 @@ func getFirstUser(authInfos map[string]*clientcmdapi.AuthInfo) (*clientcmdapi.Au
 	return nil, fmt.Errorf("no user found in kubeconfig")
 }
 
-func GetTokenExpiration(token string) (time.Time, error) {
+// tokenRefreshThreshold returns how long before expiry the token gets refreshed: half of its lifetime,
+// at most remainingTokenExpirationTime. Short-lived tokens (e.g. 5 minutes) are so refreshed before they expire.
+func tokenRefreshThreshold(token string) time.Duration {
+	claims, err := tokenClaims(token)
+	if err != nil {
+		return remainingTokenExpirationTime
+	}
+	iat, okIat := claims["iat"].(float64)
+	exp, okExp := claims["exp"].(float64)
+	if !okIat || !okExp || exp <= iat {
+		return remainingTokenExpirationTime
+	}
+
+	half := time.Duration(exp-iat) * time.Second / 2
+	return min(half, remainingTokenExpirationTime)
+}
+
+// IsLegacyKubeconfigSecret reports whether a web terminal kubeconfig Secret uses the old format with
+// the OIDC auth provider, which holds the refresh token and the client secret.
+func IsLegacyKubeconfigSecret(secret *corev1.Secret) bool {
+	cfg, err := clientcmd.Load(secret.Data["kubeconfig"])
+	if err != nil {
+		return false
+	}
+	for _, authInfo := range cfg.AuthInfos {
+		if authInfo != nil && authInfo.AuthProvider != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func tokenClaims(token string) (map[string]interface{}, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) < 2 {
-		return time.Time{}, fmt.Errorf("invalid token format")
+		return nil, fmt.Errorf("invalid token format")
 	}
 
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return time.Time{}, fmt.Errorf("failed to decode token: %w", err)
+		return nil, fmt.Errorf("failed to decode token: %w", err)
 	}
 
 	var claims map[string]interface{}
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return time.Time{}, fmt.Errorf("failed to unmarshal claims: %w", err)
+		return nil, fmt.Errorf("failed to unmarshal claims: %w", err)
+	}
+	return claims, nil
+}
+
+func GetTokenExpiration(token string) (time.Time, error) {
+	claims, err := tokenClaims(token)
+	if err != nil {
+		return time.Time{}, err
 	}
 
 	expFloat, ok := claims["exp"].(float64)
@@ -932,17 +1168,21 @@ func GetTokenExpiration(token string) (time.Time, error) {
 	return time.Unix(int64(expFloat), 0), nil
 }
 
-func onFailedUpdatingToken(websocketConn *websocket.Conn, tokenExpirationTime time.Time) {
+// onFailedUpdatingToken waits before the next refresh attempt. It returns false when ctx is done.
+func onFailedUpdatingToken(ctx context.Context, websocketConn jsonWriter, tokenExpirationTime time.Time) bool {
 	// If the token is already expired, send a message to the client and check every 5 seconds if the user authenticates again (update the kubeconfig secret).
 	if time.Until(tokenExpirationTime) <= 0 {
 		log.Logger.Debug("Token is already expired, and cannot be refreshed")
 		_ = SendMessage(websocketConn, string(WebTerminalTokenExpired))
-		time.Sleep(5 * time.Second)
-	} else {
-		// If the token is still valid but can't be refreshed, try again after 1 minute.
-		if time.Until(tokenExpirationTime) <= 1*time.Minute {
-			time.Sleep(time.Until(tokenExpirationTime)) // wait until the token is expired
-		}
-		time.Sleep(1 * time.Minute)
+		return sleepCtx(ctx, 5*time.Second)
 	}
+
+	// If the token is still valid but can't be refreshed, try again after 1 minute.
+	if time.Until(tokenExpirationTime) <= 1*time.Minute {
+		// wait until the token is expired
+		if !sleepCtx(ctx, time.Until(tokenExpirationTime)) {
+			return false
+		}
+	}
+	return sleepCtx(ctx, 1*time.Minute)
 }

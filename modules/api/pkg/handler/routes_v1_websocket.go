@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -302,7 +303,7 @@ func getTerminalWatchHandler(writer WebsocketTerminalWriter, providers watcher.P
 		defer ws.Close()
 
 		// Checking user active connections for project cluster
-		userProjectClusterUniqueKey := fmt.Sprintf("%s-%s-%s", projectID, clusterID, authenticatedUser.Email)
+		userProjectClusterUniqueKey := fmt.Sprintf("%s-%s-%s", projectID, clusterID, strings.ToLower(authenticatedUser.Email))
 		if connectionsPerUser.getActiveConnections(userProjectClusterUniqueKey) >= maxNumberOfConnections {
 			log.Logger.Debug("reached the maximum number of terminal active connections for the user")
 			_ = wsh.SendMessage(ws, string(wsh.ConnectionPoolExceeded))
@@ -316,13 +317,21 @@ func getTerminalWatchHandler(writer WebsocketTerminalWriter, providers watcher.P
 			if err := client.Get(ctx, ctrlruntimeclient.ObjectKey{
 				Namespace: metav1.NamespaceSystem,
 				Name:      handlercommon.KubeconfigSecretName(userEmailID),
-			}, kubeconfigSecret); err == nil {
-				// secret exists
-				return true
+			}, kubeconfigSecret); err != nil {
+				log.Logger.Debug(err)
+				_ = wsh.SendMessage(ws, string(wsh.KubeconfigSecretMissing))
+				return false
 			}
-			log.Logger.Debug(err)
-			_ = wsh.SendMessage(ws, string(wsh.KubeconfigSecretMissing))
-			return false
+			// an old format secret holds the refresh token and the client secret, delete it so that
+			// the UI runs the login popup again, which writes the new format
+			if wsh.IsLegacyKubeconfigSecret(kubeconfigSecret) {
+				if err := client.Delete(ctx, kubeconfigSecret); ctrlruntimeclient.IgnoreNotFound(err) != nil {
+					log.Logger.Debug(err)
+				}
+				_ = wsh.SendMessage(ws, string(wsh.KubeconfigSecretMissing))
+				return false
+			}
+			return true
 		}) {
 			return
 		}

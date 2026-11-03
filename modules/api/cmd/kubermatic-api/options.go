@@ -52,6 +52,7 @@ type serverRunOptions struct {
 	caBundle                       *certificates.CABundle
 	oidcIssuerConfiguration        *authtypes.OIDCConfiguration
 	oidcAuthenticatorConfiguration *authtypes.OIDCConfiguration
+	oidcLoginConfiguration         *authtypes.OIDCConfiguration
 
 	// for development purposes, a local configuration file
 	// can be used to provide the KubermaticConfiguration
@@ -60,6 +61,7 @@ type serverRunOptions struct {
 	// OIDC configuration
 	oidcURL                        string
 	oidcAuthenticatorClientID      string
+	oidcAuthenticatorClientSecret  string
 	oidcIssuerClientID             string
 	oidcIssuerClientSecret         string
 	oidcIssuerRedirectURI          string
@@ -96,6 +98,7 @@ func newServerRunOptions() (serverRunOptions, error) {
 	flag.StringVar(&s.oidcURL, "oidc-url", "", "URL of the OpenID token issuer. Example: http://auth.int.kubermatic.io")
 	flag.BoolVar(&s.oidcSkipTLSVerify, "oidc-skip-tls-verify", false, "Skip TLS verification for the token issuer")
 	flag.StringVar(&s.oidcAuthenticatorClientID, "oidc-authenticator-client-id", "", "Authenticator client ID")
+	flag.StringVar(&s.oidcAuthenticatorClientSecret, "oidc-authenticator-client-secret", "", "Secret of the authenticator client. When set, the dashboard login uses the authenticator client instead of the issuer client.")
 	flag.StringVar(&s.oidcIssuerClientID, "oidc-issuer-client-id", "", "Issuer client ID")
 	flag.StringVar(&s.oidcIssuerClientSecret, "oidc-issuer-client-secret", "", "OpenID client secret")
 	flag.StringVar(&s.oidcIssuerRedirectURI, "oidc-issuer-redirect-uri", "", "Callback URL for OpenID responses.")
@@ -152,7 +155,58 @@ func newServerRunOptions() (serverRunOptions, error) {
 		SkipTLSVerify: s.oidcSkipTLSVerify,
 	}
 
+	s.oidcLoginConfiguration = buildOIDCLoginConfiguration(s.oidcIssuerConfiguration, s.oidcAuthenticatorClientID, s.oidcAuthenticatorClientSecret)
+
+	s.rejectIssuerAudienceOnLogin()
+
 	return s, nil
+}
+
+// separateLoginClientConfigured reports whether the dashboard login uses its own OIDC
+// client, distinct from the issuer client that user clusters trust. Only then can the
+// KKP API tell user cluster tokens apart from its own logins. Endpoints that hand out
+// user cluster credentials must not be registered without it.
+func (o serverRunOptions) separateLoginClientConfigured() bool {
+	return o.oidcAuthenticatorClientSecret != "" && o.oidcAuthenticatorClientID != o.oidcIssuerClientID
+}
+
+// userClusterTokensEnabled reports whether per-cluster kubeconfig tokens are active:
+// the UserClusterTokenWebhook feature gate is on and the dashboard login uses a
+// client separate from the issuer client. The export endpoint and the token
+// management API must not be registered without it.
+func (o serverRunOptions) userClusterTokensEnabled() bool {
+	return o.separateLoginClientConfigured() && o.featureGates.Enabled(features.UserClusterTokenWebhook)
+}
+
+// rejectIssuerAudienceOnLogin makes the KKP API refuse ID tokens issued for the user
+// clusters' issuer client, once the dashboard login has its own client.
+func (o *serverRunOptions) rejectIssuerAudienceOnLogin() {
+	if !o.separateLoginClientConfigured() {
+		return
+	}
+
+	rejected := []string{o.oidcIssuerClientID}
+	o.oidcAuthenticatorConfiguration.RejectedAudiences = rejected
+	o.oidcLoginConfiguration.RejectedAudiences = rejected
+}
+
+// buildOIDCLoginConfiguration returns the OIDC configuration for the dashboard
+// login flow when a secret for the authenticator client is configured. It returns
+// nil otherwise, and the login flow then keeps using the issuer client.
+func buildOIDCLoginConfiguration(issuer *authtypes.OIDCConfiguration, authenticatorClientID, authenticatorClientSecret string) *authtypes.OIDCConfiguration {
+	if authenticatorClientSecret == "" {
+		return nil
+	}
+
+	return &authtypes.OIDCConfiguration{
+		URL:                  issuer.URL,
+		ClientID:             authenticatorClientID,
+		ClientSecret:         authenticatorClientSecret,
+		SecureCookie:         issuer.SecureCookie,
+		CookieSecureMode:     issuer.CookieSecureMode,
+		OfflineAccessAsScope: issuer.OfflineAccessAsScope,
+		SkipTLSVerify:        issuer.SkipTLSVerify,
+	}
 }
 
 func (o serverRunOptions) validate() error {
@@ -216,7 +270,7 @@ type providers struct {
 	applicationDefinitionProvider                  provider.ApplicationDefinitionProvider
 	privilegedOperatingSystemProfileProviderGetter provider.PrivilegedOperatingSystemProfileProviderGetter
 	oidcIssuerVerifierProviderGetter               provider.OIDCIssuerVerifierGetter
-	oidcIssuerVerifier                             authtypes.OIDCIssuerVerifier
+	oidcLoginVerifier                              authtypes.OIDCIssuerVerifier
 	policyTemplateProvider                         provider.PolicyTemplateProvider
 }
 

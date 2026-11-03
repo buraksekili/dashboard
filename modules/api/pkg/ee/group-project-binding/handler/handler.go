@@ -227,6 +227,10 @@ func CreateGroupProjectBinding(ctx context.Context, request interface{},
 		return nil, err
 	}
 
+	if err := requireBindingManager(userInfo); err != nil {
+		return nil, err
+	}
+
 	bindingName := fmt.Sprintf("%s-%s", kubermaticProject.Name, rand.String(10))
 	if err := bindingProvider.Create(ctx, userInfo, &kubermaticv1.GroupProjectBinding{
 		ObjectMeta: metav1.ObjectMeta{
@@ -280,6 +284,10 @@ func DeleteGroupProjectBinding(ctx context.Context, request interface{},
 	userInfo, err := getUserInfo(ctx, userInfoGetter, kubermaticProject.Name)
 	if err != nil {
 		return common.KubernetesErrorToHTTPError(err)
+	}
+
+	if err := requireBindingManager(userInfo); err != nil {
+		return err
 	}
 
 	if err := bindingProvider.Delete(ctx, userInfo, req.BindingName); err != nil {
@@ -355,6 +363,10 @@ func PatchGroupProjectBinding(ctx context.Context, request interface{},
 		return nil, common.KubernetesErrorToHTTPError(err)
 	}
 
+	if err := requireBindingManager(userInfo); err != nil {
+		return nil, err
+	}
+
 	originalBinding, err := bindingProvider.Get(ctx, userInfo, req.BindingName)
 	if err != nil {
 		return nil, common.KubernetesErrorToHTTPError(err)
@@ -405,4 +417,18 @@ func getUserInfo(ctx context.Context, userInfoGetter provider.UserInfoGetter, pr
 	}
 
 	return userInfo, err
+}
+
+// projectManagersRole is the project role that manages members but not clusters. The
+// provider package has no constant for it.
+const projectManagersRole = "projectmanagers"
+
+// requireBindingManager allows only KKP admins, project owners and project managers to
+// manage group bindings, the same rule as the UI and as for user bindings. Without it,
+// project editors could bind an identity provider group they belong to as owners.
+func requireBindingManager(userInfo *provider.UserInfo) error {
+	if userInfo.IsAdmin || userInfo.Roles.HasAny(provider.OwnersRole, projectManagersRole) {
+		return nil
+	}
+	return utilerrors.New(http.StatusForbidden, "only project owners, project managers and admins can manage group bindings")
 }

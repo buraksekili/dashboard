@@ -15,9 +15,12 @@
 import {Component, Input, OnInit, ChangeDetectionStrategy} from '@angular/core';
 import {BrandingService} from '@core/services/branding';
 import {Auth} from '@core/services/auth/service';
+import {KubeconfigTokenService} from '@core/services/kubeconfig-token';
 import {UserService} from '@core/services/user';
 import {Cluster} from '@shared/entity/cluster';
-import {take} from 'rxjs/operators';
+import {KubeconfigTokenSettings} from '@shared/entity/kubeconfig-token';
+import {of} from 'rxjs';
+import {catchError, take} from 'rxjs/operators';
 import {CLICK_TO_COPY_TOOLTIP} from '@app/shared/constants/common';
 import {ClusterService} from '@core/services/cluster';
 import {getEditionVersion} from '@shared/utils/common';
@@ -54,9 +57,12 @@ export class ShareKubeconfigComponent implements OnInit {
   isOIDCKubeLoginEnabled = false;
   buttonIcon: string;
   buttonLabel: string;
+  // set when per-cluster kubeconfig tokens are enabled for this installation
+  tokenSettings: KubeconfigTokenSettings = null;
 
   constructor(
     private readonly _clusterService: ClusterService,
+    private readonly _tokenService: KubeconfigTokenService,
     private readonly _auth: Auth,
     private readonly _userService: UserService,
     private readonly _matDialogRef: MatDialogRef<ShareKubeconfigComponent>,
@@ -66,6 +72,20 @@ export class ShareKubeconfigComponent implements OnInit {
   ngOnInit(): void {
     this.buttonIcon = this.dialogTitle === ShareKubeconfigDialogMode.Share ? 'km-icon-check' : 'km-icon-download';
     this.buttonLabel = this.dialogTitle === ShareKubeconfigDialogMode.Share ? 'Got It' : 'Get Kubeconfig';
+
+    // a 404 means per-cluster kubeconfig tokens are not enabled; the legacy flow stays
+    this._tokenService
+      .getSettings(this.projectID, this.cluster.id)
+      .pipe(
+        take(1),
+        catchError(() => of(null))
+      )
+      .subscribe(settings => {
+        this.tokenSettings = settings;
+        this.getDownloadLink();
+      });
+
+    // the legacy link needs the user ID from the query string
     if (this._auth.authenticated()) {
       this._userService.currentUser.pipe(take(1)).subscribe(user => {
         this._userID = user.id;
@@ -75,6 +95,11 @@ export class ShareKubeconfigComponent implements OnInit {
   }
 
   getDownloadLink(): void {
+    if (this.tokenSettings) {
+      this.kubeconfigLink = this._tokenService.getExportURL(this.cluster.id);
+      return;
+    }
+
     this.kubeconfigLink = this._clusterService.getShareKubeconfigURL(
       this.projectID,
       this.cluster.id,
