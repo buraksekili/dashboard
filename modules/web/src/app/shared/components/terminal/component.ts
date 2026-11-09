@@ -34,8 +34,6 @@ import {ClusterService} from '@core/services/cluster';
 import {PathParam} from '@core/services/params';
 import {WebTerminalSocketService} from '@core/services/websocket';
 import {Cluster} from '@shared/entity/cluster';
-import {UserService} from '@core/services/user';
-import {Member} from '@shared/entity/member';
 import {ITerminalFrame, LayoutType, TerminalConfig} from '@shared/model/Terminal';
 import {debounce} from 'lodash';
 import {Subject} from 'rxjs';
@@ -62,10 +60,9 @@ enum Operations {
 }
 
 enum ErrorOperations {
-  KubeConfigSecretMissing = 'KUBECONFIG_SECRET_MISSING',
-  KubeConfigSecretInvalid = 'KUBECONFIG_SECRET_INVALID',
-  WebTerminalTokenExpired = 'WEBTERMINAL_TOKEN_EXPIRED',
   WebTerminalPodPending = 'WEBTERMINAL_POD_PENDING',
+  WebTerminalIdentityUnsupported = 'WEBTERMINAL_IDENTITY_UNSUPPORTED',
+  WebTerminalIdentityRejected = 'WEBTERMINAL_IDENTITY_REJECTED',
   ConnectionPoolExceeded = 'CONNECTION_POOL_EXCEEDED',
   RefreshesLimitExceeded = 'REFRESHES_LIMIT_EXCEEDED',
 }
@@ -73,7 +70,6 @@ enum ErrorOperations {
 enum MessageTypes {
   Ping = 'PING',
   Pong = 'PONG',
-  WebTerminalTokenValid = 'WEBTERMINAL_TOKEN_VALID',
 }
 @Component({
   selector: 'km-terminal',
@@ -95,9 +91,7 @@ export class TerminalComponent implements OnChanges, OnInit, OnDestroy, AfterVie
   terminal: Terminal;
   isConnectionLost: boolean;
   isSessionExpiring: boolean;
-  isTokenExpired: boolean;
   isLoadingTerminal = true;
-  isDexAuthenticationPageOpened = false;
   showCloseButtonOnToolbar: boolean;
   showOpenInSeparateViewButtonOnToolbar: boolean;
   showCloseButtonOnStatusToolbar: boolean;
@@ -107,7 +101,6 @@ export class TerminalComponent implements OnChanges, OnInit, OnDestroy, AfterVie
   @ViewChild('terminal', {static: false}) terminalRef: ElementRef;
   @ViewChild('terminalContainer', {static: true}) terminalContainerRef: ElementRef;
 
-  private _user: Member;
   private _initializeTerminalOnSuccess: Subject<boolean> = new Subject<boolean>();
   private readonly _unsubscribe = new Subject<void>();
   private _resizeEventlistenerFn: () => void;
@@ -119,7 +112,6 @@ export class TerminalComponent implements OnChanges, OnInit, OnDestroy, AfterVie
     private readonly _activatedRoute: ActivatedRoute,
     private readonly _clusterService: ClusterService,
     private readonly _renderer: Renderer2,
-    private readonly _userService: UserService,
     private readonly _webTerminalSocketService: WebTerminalSocketService
   ) {}
 
@@ -134,8 +126,6 @@ export class TerminalComponent implements OnChanges, OnInit, OnDestroy, AfterVie
   }
 
   initSubscriptions(): void {
-    this._userService.currentUser.pipe(take(1)).subscribe(user => (this._user = user));
-
     this.projectId = this._activatedRoute.snapshot.paramMap.get(PathParam.ProjectID);
     this.clusterId = this._activatedRoute.snapshot.paramMap.get(PathParam.ClusterID);
 
@@ -252,16 +242,6 @@ export class TerminalComponent implements OnChanges, OnInit, OnDestroy, AfterVie
     this.isSessionExpiring = false;
   }
 
-  onTokenExpired(): void {
-    const url = this._getWebTerminalProxyURL();
-    window.open(url, '_blank', 'noopener,noreferrer');
-  }
-
-  private _getWebTerminalProxyURL(): string {
-    const userId = this._user?.id;
-    return this._clusterService.getWebTerminalProxyURL(this.projectId, this.cluster.id, userId);
-  }
-
   private _updateTerminalButtonsVisibility() {
     if (this.layout === LayoutType.page) {
       this.showOpenInSeparateViewButtonOnToolbar = false;
@@ -296,17 +276,12 @@ export class TerminalComponent implements OnChanges, OnInit, OnDestroy, AfterVie
   }
 
   private _handelOperationsError(data: string): void {
-    if (data === ErrorOperations.KubeConfigSecretMissing) {
-      if (!this.isDexAuthenticationPageOpened) {
-        const url = this._getWebTerminalProxyURL();
-        window.open(url, '_blank', 'noopener,noreferrer');
-        this.isDexAuthenticationPageOpened = true;
-      }
-      this.message = 'Please wait, authenticate in order to access web terminal...';
-    } else if (data === ErrorOperations.WebTerminalPodPending) {
+    if (data === ErrorOperations.WebTerminalPodPending) {
       this.message = 'Please wait, provisioning your Web Terminal pod...';
-    } else if (data === ErrorOperations.WebTerminalTokenExpired || data === ErrorOperations.KubeConfigSecretInvalid) {
-      this.isTokenExpired = true;
+    } else if (data === ErrorOperations.WebTerminalIdentityUnsupported) {
+      this.message = 'The Web Terminal is not available for this cluster because of its authentication configuration.';
+    } else if (data === ErrorOperations.WebTerminalIdentityRejected) {
+      this.message = 'The Web Terminal is not available for your account.';
     } else if (data === ErrorOperations.ConnectionPoolExceeded) {
       const message = `Oops! There could be ${this.MAX_SESSION_SUPPORTED} concurrent session per user. Please either discard or close other sessions`;
       if (this.terminal) {
@@ -323,9 +298,7 @@ export class TerminalComponent implements OnChanges, OnInit, OnDestroy, AfterVie
   }
 
   private _handelMessageTypes(data: string): void {
-    if (data === MessageTypes.WebTerminalTokenValid) {
-      this.isTokenExpired = false;
-    } else if (data === MessageTypes.Ping) {
+    if (data === MessageTypes.Ping) {
       if (this.terminal) {
         // Note: Periodic exchange of messages with server to keep the web Terminal connection alive
         this._keepConnectionAlive(MessageTypes.Pong);

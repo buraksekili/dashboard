@@ -249,10 +249,6 @@ export class ClusterService {
     return `${this._newRestRoot}/dashboard/login?projectID=${projectID}&clusterID=${clusterID}`;
   }
 
-  getWebTerminalProxyURL(projectID: string, clusterID: string, userID: string): string {
-    return `${this._newRestRoot}/kubeconfig/secret?project_id=${projectID}&cluster_id=${clusterID}&user_id=${userID}`;
-  }
-
   getShareKubeconfigURL(projectID: string, clusterID: string, userID: string, oidcKubeLogin = false): string {
     const location = this._location.endsWith('/') ? this._location : `${this._location}/`;
     const restRoot = this._restRoot.startsWith('/') ? this._restRoot.slice(1) : this._restRoot;

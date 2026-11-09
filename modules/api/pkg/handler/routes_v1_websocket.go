@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,8 +42,6 @@ import (
 	kubermaticcontext "k8c.io/kubermatic/v2/pkg/util/context"
 	utilerrors "k8c.io/kubermatic/v2/pkg/util/errors"
 
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -81,12 +80,11 @@ var upgrader = websocket.Upgrader{
 
 type WebsocketSettingsWriter func(ctx context.Context, providers watcher.Providers, ws *websocket.Conn)
 type WebsocketUserWriter func(ctx context.Context, providers watcher.Providers, ws *websocket.Conn, userEmail string)
-type WebsocketTerminalWriter func(ctx context.Context, ws *websocket.Conn, client, seedClient ctrlruntimeclient.Client, k8sClient kubernetes.Interface, cfg *rest.Config, userEmailID string, cluster *kubermaticv1.Cluster, options *kubermaticv1.WebTerminalOptions, oidcIssuerVerifier authtypes.OIDCIssuerVerifier, kubeconfigSecret *corev1.Secret, overwriteRegistry string)
+type WebsocketTerminalWriter func(ctx context.Context, ws *websocket.Conn, client, seedClient ctrlruntimeclient.Client, k8sClient kubernetes.Interface, cfg *rest.Config, claims authtypes.TokenClaims, seed *kubermaticv1.Seed, cluster *kubermaticv1.Cluster, options *kubermaticv1.WebTerminalOptions, overwriteRegistry string)
 
 const (
 	maxNumberOfTerminalActiveConnectionsPerUser = 5
 	terminalActiveConnectionsMemoryDuration     = 24 * time.Hour
-	waitForKubeconfigSecretTimeout              = 5 * time.Minute
 )
 
 func (r Routing) RegisterV1Websocket(mux *mux.Router, overwriteRegistry string) {
@@ -233,11 +231,12 @@ func getTerminalWatchHandler(writer WebsocketTerminalWriter, providers watcher.P
 			return
 		}
 
-		authenticatedUser, err := verifyAuthorizationToken(req, routing.tokenVerifiers, routing.tokenExtractors)
+		claims, err := verifyAuthorizationTokenClaims(req, routing.tokenVerifiers, routing.tokenExtractors)
 		if err != nil {
 			log.Logger.Debug(err)
 			return
 		}
+		authenticatedUser := userFromClaims(claims)
 
 		clusterID, err := common.DecodeClusterID(ctx, req)
 		if err != nil {
@@ -259,11 +258,6 @@ func getTerminalWatchHandler(writer WebsocketTerminalWriter, providers watcher.P
 			return
 		}
 
-		oidcIssuerVerifier, err := middleware.GetOIDCIssuerVerifier(ctx, providers.ClusterProviderGetter, providers.OIDCIssuerVerifierGetter, providers.SeedsGetter, clusterID)
-		if err != nil {
-			return
-		}
-
 		privilegedClusterProvider := clusterProvider.(provider.PrivilegedClusterProvider)
 
 		user, err := providers.UserProvider.UserByEmail(ctx, authenticatedUser.Email)
@@ -279,7 +273,6 @@ func getTerminalWatchHandler(writer WebsocketTerminalWriter, providers watcher.P
 			return
 		}
 
-		userEmailID := wsh.EncodeUserEmailtoID(authenticatedUser.Email)
 		k8sClient, err := clusterProvider.GetAdminK8sClientForUserCluster(ctx, cluster)
 		if err != nil {
 			return
@@ -302,7 +295,7 @@ func getTerminalWatchHandler(writer WebsocketTerminalWriter, providers watcher.P
 		defer ws.Close()
 
 		// Checking user active connections for project cluster
-		userProjectClusterUniqueKey := fmt.Sprintf("%s-%s-%s", projectID, clusterID, authenticatedUser.Email)
+		userProjectClusterUniqueKey := fmt.Sprintf("%s-%s-%s", projectID, clusterID, strings.ToLower(authenticatedUser.Email))
 		if connectionsPerUser.getActiveConnections(userProjectClusterUniqueKey) >= maxNumberOfConnections {
 			log.Logger.Debug("reached the maximum number of terminal active connections for the user")
 			_ = wsh.SendMessage(ws, string(wsh.ConnectionPoolExceeded))
@@ -311,23 +304,7 @@ func getTerminalWatchHandler(writer WebsocketTerminalWriter, providers watcher.P
 		connectionsPerUser.increaseActiveConnections(userProjectClusterUniqueKey)
 		defer connectionsPerUser.decreaseActiveConnections(userProjectClusterUniqueKey)
 
-		kubeconfigSecret := &corev1.Secret{}
-		if !wsh.WaitFor(ctx, 5*time.Second, waitForKubeconfigSecretTimeout, func(ctx context.Context) bool {
-			if err := client.Get(ctx, ctrlruntimeclient.ObjectKey{
-				Namespace: metav1.NamespaceSystem,
-				Name:      handlercommon.KubeconfigSecretName(userEmailID),
-			}, kubeconfigSecret); err == nil {
-				// secret exists
-				return true
-			}
-			log.Logger.Debug(err)
-			_ = wsh.SendMessage(ws, string(wsh.KubeconfigSecretMissing))
-			return false
-		}) {
-			return
-		}
-
-		writer(ctx, ws, client, seedClient, k8sClient, cfg, userEmailID, cluster, settings.Spec.WebTerminalOptions, oidcIssuerVerifier, kubeconfigSecret, overwriteRegistry)
+		writer(ctx, ws, client, seedClient, k8sClient, cfg, claims, seedOfDatacenter(providers.SeedsGetter, cluster.Spec.Cloud.DatacenterName), cluster, settings.Spec.WebTerminalOptions, overwriteRegistry)
 	}
 }
 
@@ -341,29 +318,58 @@ func (req terminalReq) GetSeedCluster() apiv1.SeedCluster {
 	}
 }
 
+// verifyAuthorizationToken returns the user of the request token.
 func verifyAuthorizationToken(req *http.Request, tokenVerifier authtypes.TokenVerifier, tokenExtractor authtypes.TokenExtractor) (*apiv1.User, error) {
-	token, err := tokenExtractor.Extract(req)
+	claims, err := verifyAuthorizationTokenClaims(req, tokenVerifier, tokenExtractor)
 	if err != nil {
 		return nil, err
+	}
+	return userFromClaims(claims), nil
+}
+
+// verifyAuthorizationTokenClaims returns the claims of the request token.
+func verifyAuthorizationTokenClaims(req *http.Request, tokenVerifier authtypes.TokenVerifier, tokenExtractor authtypes.TokenExtractor) (authtypes.TokenClaims, error) {
+	token, err := tokenExtractor.Extract(req)
+	if err != nil {
+		return authtypes.TokenClaims{}, err
 	}
 
 	claims, err := tokenVerifier.Verify(req.Context(), token)
 	if err != nil {
-		return nil, err
+		return authtypes.TokenClaims{}, err
 	}
 
 	if claims.Subject == "" {
-		return nil, utilerrors.NewNotAuthorized()
+		return authtypes.TokenClaims{}, utilerrors.NewNotAuthorized()
 	}
 
-	user := &apiv1.User{
+	return claims, nil
+}
+
+// userFromClaims returns the user of the claims. Groups holds the groups claim.
+func userFromClaims(claims authtypes.TokenClaims) *apiv1.User {
+	return &apiv1.User{
 		ObjectMeta: apiv1.ObjectMeta{
 			Name: claims.Name,
 		},
-		Email: claims.Email,
+		Email:  claims.Email,
+		Groups: claims.Groups,
 	}
+}
 
-	return user, nil
+// seedOfDatacenter returns the seed that holds the datacenter, or nil when it cannot be found.
+func seedOfDatacenter(seedsGetter provider.SeedsGetter, datacenterName string) *kubermaticv1.Seed {
+	seeds, err := seedsGetter()
+	if err != nil {
+		log.Logger.Debug(err)
+		return nil
+	}
+	for _, seed := range seeds {
+		if _, ok := seed.Spec.Datacenters[datacenterName]; ok {
+			return seed
+		}
+	}
+	return nil
 }
 
 func requestLoggingReader(websocket *websocket.Conn) {

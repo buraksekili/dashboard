@@ -113,7 +113,7 @@ func (o *OpenIDClient) Verify(ctx context.Context, token string) (authtypes.Toke
 		return authtypes.TokenClaims{}, err
 	}
 
-	oidcClaims := authtypes.TokenClaims{}
+	oidcClaims := authtypes.TokenClaims{Raw: claims}
 	if rawName, found := claims["name"]; found {
 		oidcClaims.Name = rawName.(string)
 	}

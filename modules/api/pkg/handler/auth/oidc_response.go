@@ -56,10 +56,6 @@ func writeOIDCCallbackHTML(w http.ResponseWriter, statusCode int, title, titleCl
 	}
 }
 
-func OIDCCallbackSuccessResponse(w http.ResponseWriter) {
-	writeOIDCCallbackHTML(w, http.StatusOK, "Login successful", "title", "You can close this tab and return to the previous page.")
-}
-
 func OIDCCallbackErrorEncoder(_ context.Context, err error, w http.ResponseWriter) {
 	errorCode := http.StatusInternalServerError
 	errMsg := err.Error()

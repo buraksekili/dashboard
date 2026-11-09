@@ -121,6 +121,8 @@ type TokenClaims struct {
 	Groups  []string
 	Nonce   string
 	Expiry  apiv1.Time
+	// Raw holds all claims of an OIDC ID token. It is nil for other token types.
+	Raw map[string]interface{}
 }
 
 // OIDCConfiguration is a struct that holds

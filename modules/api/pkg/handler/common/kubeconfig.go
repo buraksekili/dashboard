@@ -42,8 +42,6 @@ import (
 	utilerrors "k8c.io/kubermatic/v2/pkg/util/errors"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	apiserverserviceaccount "k8s.io/apiserver/pkg/authentication/serviceaccount"
 	"k8s.io/client-go/tools/clientcmd"
@@ -444,203 +442,22 @@ func CreateOIDCKubeconfigEndpoint(
 	return rsp, nil
 }
 
-func CreateOIDCKubeconfigSecretEndpoint(
-	ctx context.Context,
-	projectProvider provider.ProjectProvider,
-	privilegedProjectProvider provider.PrivilegedProjectProvider,
-	req CreateOIDCKubeconfigReq,
-) (interface{}, error) {
-	oidcIssuerVerifier := ctx.Value(middleware.OIDCIssuerVerifierContextKey).(authtypes.OIDCIssuerVerifier)
-	clusterProvider := ctx.Value(middleware.ClusterProviderContextKey).(provider.ClusterProvider)
-
-	cluster, err := getClusterForOIDCEndpoint(ctx, projectProvider, privilegedProjectProvider, req.ProjectID, req.ClusterID)
-	if err != nil {
-		return nil, common.KubernetesErrorToHTTPError(err)
-	}
-
-	// Override default redirect uri
-	redirectURI, err := oidcIssuerVerifier.GetRedirectURI(req.request.URL.Path)
-	if err != nil {
-		return nil, err
-	}
-
-	// PHASE exchangeCode handles callback response from OIDC provider
-	// and generates kubeconfig
-	if req.phase == exchangeCodePhase {
-		// validate the state
-		storedCookie, err := handlerauth.GetOAuthStateCookie(req.request, csrfCookieName, oidcIssuerVerifier.OIDCConfig().SecureCookie)
-		if err != nil {
-			return nil, err
-		}
-		if req.decodedState.State != storedCookie.State {
-			return nil, utilerrors.NewBadRequest("incorrect value of state parameter: %s", req.decodedState.State)
-		}
-		oidcTokens, err := oidcIssuerVerifier.Exchange(ctx, req.code, redirectURI, storedCookie.CodeVerifier)
-		if err != nil {
-			return nil, utilerrors.NewBadRequest("error while exchanging oidc code for token: %v", err)
-		}
-		if len(oidcTokens.RefreshToken) == 0 {
-			return nil, utilerrors.NewBadRequest("the refresh token is missing but required, try setting/unsetting \"oidc-offline-access-as-scope\" command line flag")
-		}
-
-		claims, err := oidcIssuerVerifier.Verify(ctx, oidcTokens.IDToken)
-		if err != nil {
-			return nil, utilerrors.New(http.StatusUnauthorized, err.Error())
-		}
-		// the nonce claim binds the ID token to this authentication request
-		if claims.Nonce != storedCookie.Nonce {
-			return nil, utilerrors.NewBadRequest("incorrect value of nonce claim in the ID token")
-		}
-		if len(claims.Email) == 0 {
-			return nil, utilerrors.NewBadRequest("the token doesn't contain the mandatory \"email\" claim")
-		}
-
-		adminKubeConfig, err := clusterProvider.GetAdminKubeconfigForUserCluster(ctx, cluster)
-		if err != nil {
-			return nil, common.KubernetesErrorToHTTPError(err)
-		}
-
-		// create a kubeconfig that contains OIDC tokens
-		oidcKubeCfg := clientcmdapi.NewConfig()
-		{
-			// grab admin kubeconfig to read the cluster info
-			var clusterFromAdminKubeCfg *clientcmdapi.Cluster
-			for clusterName, configCluster := range adminKubeConfig.Clusters {
-				if clusterName == req.ClusterID {
-					clusterFromAdminKubeCfg = configCluster
-				}
-
-				// If the cluster has an external address, we need to add to use that address in the KubeConfig
-				if cluster.Status.Address.APIServerExternalAddress != "" {
-					clusterFromAdminKubeCfg.Server = cluster.Status.Address.APIServerExternalAddress
-				}
-			}
-			if clusterFromAdminKubeCfg == nil {
-				return nil, utilerrors.New(http.StatusInternalServerError, fmt.Sprintf("unable to construct kubeconfig because couldn't find %s cluster entry in existing kubecfg", req.ClusterID))
-			}
-
-			// create cluster entry
-			clientCmdCluster := clientcmdapi.NewCluster()
-			clientCmdCluster.Server = clusterFromAdminKubeCfg.Server
-			clientCmdCluster.CertificateAuthorityData = clusterFromAdminKubeCfg.CertificateAuthorityData
-			oidcKubeCfg.Clusters[req.ClusterID] = clientCmdCluster
-
-			// create auth entry
-			clientCmdAuth := clientcmdapi.NewAuthInfo()
-			clientCmdAuthProvider := &clientcmdapi.AuthProviderConfig{Config: map[string]string{}}
-			clientCmdAuthProvider.Name = oidc
-			clientCmdAuthProvider.Config["id-token"] = oidcTokens.IDToken
-			clientCmdAuthProvider.Config["refresh-token"] = oidcTokens.RefreshToken
-			clientCmdAuthProvider.Config["idp-issuer-url"] = oidcIssuerVerifier.OIDCConfig().URL
-			clientCmdAuthProvider.Config["client-id"] = oidcIssuerVerifier.OIDCConfig().ClientID
-			clientCmdAuthProvider.Config["client-secret"] = oidcIssuerVerifier.OIDCConfig().ClientSecret
-			clientCmdAuth.AuthProvider = clientCmdAuthProvider
-			// Normalize email to lowercase to match how users are stored
-			email := strings.ToLower(claims.Email)
-			oidcKubeCfg.AuthInfos[email] = clientCmdAuth
-
-			// create default ctx
-			clientCmdCtx := clientcmdapi.NewContext()
-			clientCmdCtx.Cluster = req.ClusterID
-			clientCmdCtx.AuthInfo = email
-			oidcKubeCfg.Contexts[req.ClusterID] = clientCmdCtx
-			oidcKubeCfg.CurrentContext = req.ClusterID
-		}
-
-		// prepare final rsp that holds kubeconfig
-		rsp := createOIDCKubeconfigRsp{}
-		rsp.phase = kubeconfigGenerated
-		rsp.secureCookieMode = oidcIssuerVerifier.OIDCConfig().CookieSecureMode
-		rsp.secureCookie = oidcIssuerVerifier.OIDCConfig().SecureCookie
-		client, err := clusterProvider.GetAdminClientForUserCluster(ctx, cluster)
-		if err != nil {
-			return nil, common.KubernetesErrorToHTTPError(err)
-		}
-		// Use lowercase email for secret name consistency
-		email := strings.ToLower(claims.Email)
-		if err := createKubeconfigSecret(ctx, client, oidcKubeCfg, email); err != nil {
-			return nil, common.KubernetesErrorToHTTPError(err)
-		}
-		return rsp, nil
-	}
-
-	// PHASE initial handles request from the end-user that wants to authenticate
-	// and kicksoff the process of kubeconfig generation
-	if req.phase != initialPhase {
-		return nil, utilerrors.NewBadRequest("bad request unexpected phase %d, expected phase %d, did you forget to set the phase while decoding the request?", req.phase, initialPhase)
-	}
-
-	rsp := createOIDCKubeconfigRsp{}
-	scopes := []string{"openid", "email", "groups"}
-	if oidcIssuerVerifier.OIDCConfig().OfflineAccessAsScope {
-		scopes = append(scopes, "offline_access")
-	}
-
-	// pass state, nonce and PKCE verifier
-	rsp.oauthState = handlerauth.NewOAuthState()
-	rsp.secureCookieMode = oidcIssuerVerifier.OIDCConfig().CookieSecureMode
-	rsp.secureCookie = oidcIssuerVerifier.OIDCConfig().SecureCookie
-
-	oidcState := OIDCState{
-		State:     rsp.oauthState.State,
-		ClusterID: req.ClusterID,
-		ProjectID: req.ProjectID,
-		UserID:    req.UserID,
-	}
-	rawState, err := json.Marshal(oidcState)
-	if err != nil {
-		return nil, err
-	}
-	encodedState := base64.StdEncoding.EncodeToString(rawState)
-	urlSafeState := url.QueryEscape(encodedState)
-	rsp.authCodeURL = oidcIssuerVerifier.AuthCodeURL(urlSafeState, oidcIssuerVerifier.OIDCConfig().OfflineAccessAsScope, redirectURI, rsp.oauthState.CodeVerifier, rsp.oauthState.Nonce, scopes...)
-
-	return rsp, nil
-}
-
 func KubeconfigSecretName(userEmailID string) string {
 	return fmt.Sprintf("kubeconfig-%s", userEmailID)
 }
 
-func createKubeconfigSecret(ctx context.Context, client ctrlruntimeclient.Client, config *clientcmdapi.Config, email string) error {
-	// encode email address to unique ID for the secret name
-	hasher := md5.New()
-	hasher.Write([]byte(email))
-	kubeconfigSecretName := KubeconfigSecretName(hex.EncodeToString(hasher.Sum(nil)))
-	kubeconfig, err := clientcmd.Write(*config)
-	if err != nil {
-		return err
-	}
-
-	namespacedName := types.NamespacedName{Namespace: metav1.NamespaceSystem, Name: kubeconfigSecretName}
-
-	existingSecret := &corev1.Secret{}
-	if err := client.Get(ctx, namespacedName, existingSecret); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to probe for secret %v: %w", namespacedName, err)
-	}
-
-	secretData := map[string][]byte{
-		resources.KubeconfigSecretKey: kubeconfig,
-	}
-
-	return createSecret(ctx, client, kubeconfigSecretName, email, secretData, existingSecret.Name)
+// WebTerminalOIDCSecretName returns the name of the seed Secret, in the cluster namespace, that
+// held the web terminal refresh token of a user in an older version. It is only used for cleanup.
+func WebTerminalOIDCSecretName(userEmailID string) string {
+	return fmt.Sprintf("webterminal-oidc-%s", userEmailID)
 }
 
-func createSecret(ctx context.Context, client ctrlruntimeclient.Client, name, email string, secretData map[string][]byte, existingSecretName string) error {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Namespace:   metav1.NamespaceSystem,
-			Annotations: map[string]string{"user": email},
-		},
-		Type: corev1.SecretTypeOpaque,
-		Data: secretData,
-	}
-
-	if existingSecretName != "" {
-		return client.Update(ctx, secret)
-	}
-	return client.Create(ctx, secret)
+// EncodeUserEmailToID returns the ID used to name the web terminal resources of a user.
+// The email is lowercased, so all callers get the same ID whatever the case of the email claim.
+func EncodeUserEmailToID(email string) string {
+	hasher := md5.New()
+	hasher.Write([]byte(strings.ToLower(email)))
+	return hex.EncodeToString(hasher.Sum(nil))
 }
 
 // CreateOIDCKubeconfigReq represent a request for creating kubeconfig for a cluster with OIDC credentials
@@ -696,30 +513,6 @@ func EncodeOIDCKubeconfig(c context.Context, w http.ResponseWriter, response int
 	if rsp.phase == kubeconfigGenerated {
 		handlerauth.ClearOAuthStateCookie(w, csrfCookieName, "", rsp.secureCookieMode)
 		return EncodeKubeconfig(c, w, &encodeKubeConfigResponse{clientCfg: rsp.oidcKubeConfig})
-	}
-
-	// handles initialPhase
-	// redirects request to OpenID provider's consent page
-	// and set cookie with state, nonce and PKCE verifier
-	err = handlerauth.SetOAuthStateCookie(w, csrfCookieName, "", rsp.oauthState, cookieMaxAge, rsp.secureCookieMode, rsp.secureCookie)
-	if err != nil {
-		return fmt.Errorf("the cookie can't be created: %w", err)
-	}
-	w.Header().Add("Location", rsp.authCodeURL)
-	w.Header().Add("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusSeeOther)
-	return nil
-}
-
-func EncodeOIDCKubeconfigSecret(c context.Context, w http.ResponseWriter, response interface{}) (err error) {
-	rsp := response.(createOIDCKubeconfigRsp)
-
-	// handles kubeconfig Generated PHASE
-	// it means that kubeconfig was generated and we need to properly encode it.
-	if rsp.phase == kubeconfigGenerated {
-		handlerauth.ClearOAuthStateCookie(w, csrfCookieName, "", rsp.secureCookieMode)
-		handlerauth.OIDCCallbackSuccessResponse(w)
-		return nil
 	}
 
 	// handles initialPhase

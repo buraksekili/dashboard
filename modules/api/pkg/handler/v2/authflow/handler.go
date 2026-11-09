@@ -66,7 +66,7 @@ func (a *authHandler) schemeAndHost(r *http.Request) (scheme, host string) {
 	if isLocalHost(r) {
 		return requestScheme(r), r.Host
 	}
-	if uri, err := a.oidcIssuerVerifier.GetRedirectURI(callbackPath); err == nil {
+	if uri, err := a.oidcLoginVerifier.GetRedirectURI(callbackPath); err == nil {
 		if u, err := url.Parse(uri); err == nil && u.Host != "" {
 			return u.Scheme, u.Host
 		}
@@ -82,7 +82,7 @@ func (a *authHandler) getCallbackURI(r *http.Request) string {
 
 func (a *authHandler) loginHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		oidcConfig := a.oidcIssuerVerifier.OIDCConfig()
+		oidcConfig := a.oidcLoginVerifier.OIDCConfig()
 
 		oauthState := handlerauth.NewOAuthState()
 
@@ -92,7 +92,7 @@ func (a *authHandler) loginHandler() http.Handler {
 		}
 
 		redirectURI := a.getCallbackURI(r)
-		authURL := a.oidcIssuerVerifier.AuthCodeURL(oauthState.State, oidcConfig.OfflineAccessAsScope, redirectURI, oauthState.CodeVerifier, oauthState.Nonce, scopes...)
+		authURL := a.oidcLoginVerifier.AuthCodeURL(oauthState.State, oidcConfig.OfflineAccessAsScope, redirectURI, oauthState.CodeVerifier, oauthState.Nonce, scopes...)
 
 		// Store state, nonce, and PKCE verifier in a single signed cookie.
 		if err := handlerauth.SetOAuthStateCookie(w, oauthStateCookieName, "/", oauthState, oauthStateCookieMaxAge, oidcConfig.CookieSecureMode, oidcConfig.SecureCookie); err != nil {
@@ -114,7 +114,7 @@ const (
 
 func (a *authHandler) callbackHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		oidcConfig := a.oidcIssuerVerifier.OIDCConfig()
+		oidcConfig := a.oidcLoginVerifier.OIDCConfig()
 
 		// 1. Extract state and code from query params.
 		state := r.URL.Query().Get("state")
@@ -142,7 +142,7 @@ func (a *authHandler) callbackHandler() http.Handler {
 
 		// 4. Exchange authorization code for tokens with PKCE code_verifier from the cookie.
 		redirectURI := a.getCallbackURI(r)
-		oidcTokens, err := a.oidcIssuerVerifier.Exchange(r.Context(), code, redirectURI, storedState.CodeVerifier)
+		oidcTokens, err := a.oidcLoginVerifier.Exchange(r.Context(), code, redirectURI, storedState.CodeVerifier)
 		if err != nil {
 			log.Logger.Errorf("failed to exchange code for tokens: %v", err)
 			http.Error(w, "failed to exchange code for tokens", http.StatusInternalServerError)
@@ -150,7 +150,7 @@ func (a *authHandler) callbackHandler() http.Handler {
 		}
 
 		// 5. Verify id_token and check email claim.
-		claims, err := a.oidcIssuerVerifier.Verify(r.Context(), oidcTokens.IDToken)
+		claims, err := a.oidcLoginVerifier.Verify(r.Context(), oidcTokens.IDToken)
 		if err != nil {
 			log.Logger.Errorf("failed to verify id_token: %v", err)
 			http.Error(w, "failed to verify id_token", http.StatusInternalServerError)
@@ -218,7 +218,7 @@ func (a *authHandler) callbackHandler() http.Handler {
 
 func (a *authHandler) refreshHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		oidcConfig := a.oidcIssuerVerifier.OIDCConfig()
+		oidcConfig := a.oidcLoginVerifier.OIDCConfig()
 
 		// 1. Read refresh_token from cookie.
 		refreshCookie, err := r.Cookie(refreshTokenCookieName)
@@ -229,7 +229,7 @@ func (a *authHandler) refreshHandler() http.Handler {
 		}
 
 		// 2. Refresh tokens.
-		oidcTokens, err := a.oidcIssuerVerifier.RefreshAccessToken(r.Context(), refreshCookie.Value)
+		oidcTokens, err := a.oidcLoginVerifier.RefreshAccessToken(r.Context(), refreshCookie.Value)
 		if err != nil {
 			log.Logger.Errorf("failed to refresh OIDC tokens: %v", err)
 			clearAuthCookies(w, r, oidcConfig.CookieSecureMode)
@@ -238,7 +238,7 @@ func (a *authHandler) refreshHandler() http.Handler {
 		}
 
 		// 3. Verify new id_token.
-		claims, err := a.oidcIssuerVerifier.Verify(r.Context(), oidcTokens.IDToken)
+		claims, err := a.oidcLoginVerifier.Verify(r.Context(), oidcTokens.IDToken)
 		if err != nil {
 			log.Logger.Errorf("failed to verify refreshed id_token: %v", err)
 			clearAuthCookies(w, r, oidcConfig.CookieSecureMode)
@@ -302,7 +302,7 @@ func setNamedCookie(w http.ResponseWriter, name, value, path string, maxAge int,
 
 func (a *authHandler) logoutHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		clearAuthCookies(w, r, a.oidcIssuerVerifier.OIDCConfig().CookieSecureMode)
+		clearAuthCookies(w, r, a.oidcLoginVerifier.OIDCConfig().CookieSecureMode)
 
 		tokenValue, err := a.tokenExtractor.Extract(r)
 		if err != nil {
@@ -310,7 +310,7 @@ func (a *authHandler) logoutHandler() http.Handler {
 			return
 		}
 
-		claims, err := a.oidcIssuerVerifier.Verify(r.Context(), tokenValue)
+		claims, err := a.oidcLoginVerifier.Verify(r.Context(), tokenValue)
 		if err != nil {
 			log.Logger.Debugf("failed to verify id_token on logout: %v", err)
 			http.Error(w, "failed to verify id_token", http.StatusUnauthorized)
@@ -393,7 +393,7 @@ func (a *authHandler) statusHandler() http.Handler {
 			return
 		}
 
-		claims, err := a.oidcIssuerVerifier.Verify(r.Context(), tokenValue)
+		claims, err := a.oidcLoginVerifier.Verify(r.Context(), tokenValue)
 		if err != nil {
 			http.Error(w, "invalid token", http.StatusUnauthorized)
 			return

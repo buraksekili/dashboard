@@ -383,6 +383,11 @@ func createInitProviders(ctx context.Context, options serverRunOptions, masterCf
 		log.Fatalw("failed to create an openid authenticator", zap.Any("issuer", options.oidcURL), zap.Any("oidcClientID", options.oidcAuthenticatorClientID), zap.Error(err))
 	}
 
+	oidcLoginVerifier, err := createOIDCLoginVerifier(options, oidcIssuerVerifier)
+	if err != nil {
+		log.Fatalw("failed to create an openid login client", zap.Any("issuer", options.oidcURL), zap.Any("oidcClientID", options.oidcAuthenticatorClientID), zap.Error(err))
+	}
+
 	oidcIssuerVerifierProviderGetter := auth2.OIDCIssuerVerifierProviderFactory(
 		oidcIssuerVerifier,
 		options.oidcIssuerRedirectURI,
@@ -481,7 +486,7 @@ func createInitProviders(ctx context.Context, options serverRunOptions, masterCf
 		applicationDefinitionProvider:                  applicationDefinitionProvider,
 		privilegedOperatingSystemProfileProviderGetter: privilegedOperatingSystemProfileProviderGetter,
 		oidcIssuerVerifierProviderGetter:               oidcIssuerVerifierProviderGetter,
-		oidcIssuerVerifier:                             oidcIssuerVerifier,
+		oidcLoginVerifier:                              oidcLoginVerifier,
 	}, nil
 }
 
@@ -495,6 +500,15 @@ func createOIDCClients(oidcIssuerConfiguration *authtypes.OIDCConfiguration, oid
 		),
 		caBundle.CertPool(),
 	)
+}
+
+// createOIDCLoginVerifier returns the OIDC client for the dashboard login flow. Without a separate
+// login configuration the login keeps using the issuer client.
+func createOIDCLoginVerifier(options serverRunOptions, oidcIssuerVerifier authtypes.OIDCIssuerVerifier) (authtypes.OIDCIssuerVerifier, error) {
+	if options.oidcLoginConfiguration == nil {
+		return oidcIssuerVerifier, nil
+	}
+	return createOIDCClients(options.oidcLoginConfiguration, options.oidcIssuerRedirectURI, options.caBundle)
 }
 
 func createAuthClients(options serverRunOptions, prov providers) (authtypes.TokenVerifier, authtypes.TokenExtractor, error) {
@@ -609,7 +623,7 @@ func createAPIHandler(
 		ApplicationDefinitionProvider:                  prov.applicationDefinitionProvider,
 		PrivilegedOperatingSystemProfileProviderGetter: prov.privilegedOperatingSystemProfileProviderGetter,
 		OIDCIssuerVerifierProviderGetter:               prov.oidcIssuerVerifierProviderGetter,
-		OIDCIssuerVerifier:                             prov.oidcIssuerVerifier,
+		OIDCLoginVerifier:                              prov.oidcLoginVerifier,
 		Versions:                                       options.versions,
 		CABundle:                                       options.caBundle.CertPool(),
 		Features:                                       options.featureGates,
@@ -639,7 +653,7 @@ func createAPIHandler(
 	r.RegisterV1Optional(v1Router, options.featureGates.Enabled(features.OIDCKubeCfgEndpoint))
 	r.RegisterV1Admin(v1Router)
 	r.RegisterV1Websocket(v1Router, options.overwriteRegistry)
-	rv2.RegisterV2(v2Router, options.featureGates.Enabled(features.OIDCKubeCfgEndpoint))
+	rv2.RegisterV2(v2Router)
 
 	mainRouter.Methods(http.MethodGet).
 		Path("/api/swagger.json").

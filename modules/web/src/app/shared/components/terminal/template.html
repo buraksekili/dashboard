@@ -34,13 +34,11 @@ limitations under the License.
                        [showOpenInSeparateViewButton]="showOpenInSeparateViewButtonOnToolbar"
                        (openInNewTab)="openInSeparateView()"
                        (close)="onClose()" />
-  @if (isConnectionLost || isSessionExpiring || isTokenExpired) {
+  @if (isConnectionLost || isSessionExpiring) {
   <km-terminal-status-bar [isConnectionLost]="isConnectionLost"
                           [isSessionExpiring]="isSessionExpiring"
-                          [isTokenExpired]="isTokenExpired"
                           (reconnect)="onReconnect()"
-                          (extendSession)="onExtendSession()"
-                          (tokenExpired)="onTokenExpired()" />
+                          (extendSession)="onExtendSession()" />
   }
   <div #terminal></div>
 </div>

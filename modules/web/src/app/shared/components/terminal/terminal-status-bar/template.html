@@ -23,11 +23,6 @@ limitations under the License.
     </div>
     <div>
       @switch (sessionState) {
-      @case (terminalState.Expired) {
-      <p>
-        Session expired. Authenticate again and wait a few seconds for the new kubeconfig to mount.
-      </p>
-      }
       @case (terminalState.ConnectionLost) {
       <p>
         The connection to your Web Terminal was lost.
@@ -47,16 +42,6 @@ limitations under the License.
        fxLayoutAlign="end center"
        fxLayoutGap="10px">
     @switch (sessionState) {
-    @case ('expired') {
-    <button mat-flat-button
-            class="button-border-box"
-            matTooltip="Authenticate again to regain access"
-            (click)="onTokenExpired()">
-      <i class="km-icon-mask km-icon-reconnect"
-         matButtonIcon></i>
-      <span>Authenticate</span>
-    </button>
-    }
     @case ('connectionLost') {
     <button mat-flat-button
             class="button-border-box"

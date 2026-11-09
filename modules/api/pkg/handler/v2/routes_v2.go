@@ -71,18 +71,10 @@ import (
 	"k8c.io/dashboard/v2/pkg/handler/v2/user"
 	userclusterconfig "k8c.io/dashboard/v2/pkg/handler/v2/user_cluster_config"
 	"k8c.io/dashboard/v2/pkg/handler/v2/version"
-	"k8c.io/dashboard/v2/pkg/handler/v2/webterminal"
 )
 
 // RegisterV2 declares all router paths for v2.
-func (r Routing) RegisterV2(mux *mux.Router, oidcKubeConfEndpoint bool) {
-	// Defines a set of HTTP endpoint for generating kubeconfig secret for a cluster that will contain OIDC tokens
-	if oidcKubeConfEndpoint {
-		mux.Methods(http.MethodGet).
-			Path("/kubeconfig/secret").
-			Handler(r.createOIDCKubeconfigSecret())
-	}
-
+func (r Routing) RegisterV2(mux *mux.Router) {
 	// Defines a set of HTTP endpoint for interacting with
 	// various cloud providers
 	mux.Methods(http.MethodGet).
@@ -1145,7 +1137,7 @@ func (r Routing) RegisterV2(mux *mux.Router, oidcKubeConfEndpoint bool) {
 		Handler(r.listVMwareCloudDirectorComputePoliciesNoCredentials())
 
 	authflow.
-		NewAuthHandler(r.oidcIssuerVerifier, r.userProvider, r.kubermaticConfigGetter).
+		NewAuthHandler(r.oidcLoginVerifier, r.userProvider, r.kubermaticConfigGetter).
 		Install(mux)
 
 	kubernetesdashboard.
@@ -10327,35 +10319,6 @@ func (r Routing) getDefaultCluster() http.Handler {
 		clusterdefault.DecodeGetDefaultClusterReq,
 		handler.EncodeJSON,
 		r.defaultServerOptions()...,
-	)
-}
-
-// swagger:route GET /api/v2/kubeconfig/secret createOIDCKubeconfigSecret
-//
-//	Starts OIDC flow and generates kubeconfig, the generated config
-//	contains OIDC provider authentication info. The kubeconfig is stored in the secret.
-//
-//	Produces:
-//	- application/json
-//	- text/html
-//
-//	Responses:
-//	  default: errorResponse
-//	  200: empty
-//	  201: empty
-//	  401: empty
-//	  403: empty
-func (r Routing) createOIDCKubeconfigSecret() http.Handler {
-	return httptransport.NewServer(
-		endpoint.Chain(
-			middleware.SetClusterProvider(r.clusterProviderGetter, r.seedsGetter),
-			middleware.SetPrivilegedClusterProvider(r.clusterProviderGetter, r.seedsGetter),
-			middleware.UserInfoUnauthorized(r.userProjectMapper, r.userProvider),
-			middleware.OIDCProviders(r.clusterProviderGetter, r.oidcIssuerVerifierProviderGetter, r.seedsGetter),
-		)(webterminal.CreateOIDCKubeconfigSecretEndpoint(r.projectProvider, r.privilegedProjectProvider)),
-		webterminal.DecodeCreateOIDCKubeconfig,
-		webterminal.EncodeOIDCKubeconfig,
-		append(r.defaultServerOptions(), httptransport.ServerErrorEncoder(handlerauth.OIDCCallbackErrorEncoder))...,
 	)
 }
 
