@@ -118,11 +118,14 @@ export class AlertmanagerConfigComponent implements OnInit, OnChanges, OnDestroy
     const seed =
       !!this._seedSettings && !!this._seedSettings.seedDNSOverwrite ? this._seedSettings.seedDNSOverwrite : this._seed;
 
+    // the MLA hosts live under the KKP domain, which differs from the browser hostname behind a reverse proxy
+    const domain = this._seedSettings?.kubermaticDomain || this._document.defaultView.location.hostname;
+
     switch (type) {
       case Type.Alertmanager:
-        return `https://${this._settings.mlaAlertmanagerPrefix}.${seed}.${this._document.defaultView.location.hostname}/${this.cluster.id}`;
+        return `https://${this._settings.mlaAlertmanagerPrefix}.${seed}.${domain}/${this.cluster.id}`;
       case Type.Grafana:
-        return `https://${this._settings.mlaGrafanaPrefix}.${seed}.${this._document.defaultView.location.hostname}/?orgId=${this._grafanaOrgId}`;
+        return `https://${this._settings.mlaGrafanaPrefix}.${seed}.${domain}/?orgId=${this._grafanaOrgId}`;
       default:
         return '';
     }

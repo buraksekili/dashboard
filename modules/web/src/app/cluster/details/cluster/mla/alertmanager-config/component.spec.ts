@@ -27,6 +27,7 @@ import {NotificationService} from '@core/services/notification';
 import {SettingsService} from '@core/services/settings';
 import {UserService} from '@core/services/user';
 import {Application, KUBE_STATE_METRICS_APP_DEF_NAME, NODE_EXPORTER_APP_DEF_NAME} from '@shared/entity/application';
+import {SeedSettings} from '@shared/entity/datacenter';
 import {SharedModule} from '@shared/module';
 import {NoopConfirmDialogComponent} from '@test/components/noop-confirmation-dialog.component';
 import {fakeDigitaloceanCluster} from '@test/data/cluster';
@@ -40,7 +41,7 @@ import {RouterStub} from '@test/services/router-stubs';
 import {SettingsMockService} from '@test/services/settings-mock';
 import {UserMockService} from '@test/services/user-mock';
 import {of} from 'rxjs';
-import {AlertmanagerConfigComponent} from './component';
+import {AlertmanagerConfigComponent, Type} from './component';
 
 describe('AlertmanagerConfigComponent', () => {
   let fixture: ComponentFixture<AlertmanagerConfigComponent>;
@@ -111,6 +112,39 @@ describe('AlertmanagerConfigComponent', () => {
     fixture.destroy();
     flush();
   }));
+
+  describe('MLA links', () => {
+    beforeEach(() => {
+      component['_settings'] = {
+        ...component['_settings'],
+        mlaAlertmanagerPrefix: 'alertmanager',
+        mlaGrafanaPrefix: 'grafana',
+      };
+      component['_seed'] = 'europe';
+      component['_grafanaOrgId'] = '7';
+    });
+
+    it('should build the links on the KKP domain', () => {
+      component['_seedSettings'] = {kubermaticDomain: 'kkp.example.com'} as SeedSettings;
+
+      expect(component.getLinkURL(Type.Alertmanager)).toBe(
+        `https://alertmanager.europe.kkp.example.com/${component.cluster.id}`
+      );
+      expect(component.getLinkURL(Type.Grafana)).toBe('https://grafana.europe.kkp.example.com/?orgId=7');
+    });
+
+    it('should use the seed DNS overwrite with the KKP domain', () => {
+      component['_seedSettings'] = {kubermaticDomain: 'kkp.example.com', seedDNSOverwrite: 'eu'} as SeedSettings;
+
+      expect(component.getLinkURL(Type.Grafana)).toBe('https://grafana.eu.kkp.example.com/?orgId=7');
+    });
+
+    it('should fall back to the browser hostname without a KKP domain', () => {
+      component['_seedSettings'] = {} as SeedSettings;
+
+      expect(component.getLinkURL(Type.Grafana)).toBe(`https://grafana.europe.${window.location.hostname}/?orgId=7`);
+    });
+  });
 
   describe('Grafana monitoring components warning', () => {
     const fakeApplication = (name: string): Application =>

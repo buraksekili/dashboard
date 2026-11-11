@@ -28,7 +28,9 @@ import (
 	"k8c.io/dashboard/v2/pkg/handler/test"
 	"k8c.io/dashboard/v2/pkg/handler/test/hack"
 	kubermaticv1 "k8c.io/kubermatic/sdk/v2/apis/kubermatic/v1"
+	"k8c.io/kubermatic/v2/pkg/resources"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -39,6 +41,7 @@ func TestGetSeedSettingsEndpoint(t *testing.T) {
 		seedName               string
 		existingAPIUser        *apiv1.User
 		existingKubermaticObjs []ctrlruntimeclient.Object
+		kubermaticConfig       *kubermaticv1.KubermaticConfiguration
 		expectedHTTPStatus     int
 		expectedResponse       apiv2.SeedSettings
 	}{
@@ -106,13 +109,37 @@ func TestGetSeedSettingsEndpoint(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:     "scenario 5: seed settings carry the KKP domain for the MLA links",
+			seedName: "us-central1",
+			existingKubermaticObjs: []ctrlruntimeclient.Object{
+				test.GenDefaultUser(),
+				test.GenTestSeed(),
+			},
+			kubermaticConfig: &kubermaticv1.KubermaticConfiguration{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "kubermatic",
+					Namespace: resources.KubermaticNamespace,
+				},
+				Spec: kubermaticv1.KubermaticConfigurationSpec{
+					Ingress: kubermaticv1.KubermaticIngressConfiguration{
+						Domain: "kkp.example.com",
+					},
+				},
+			},
+			existingAPIUser:    test.GenDefaultAPIUser(),
+			expectedHTTPStatus: http.StatusOK,
+			expectedResponse: apiv2.SeedSettings{
+				KubermaticDomain: "kkp.example.com",
+			},
+		},
 	}
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, requestURL(tc.seedName), nil)
 			resp := httptest.NewRecorder()
-			ep, err := test.CreateTestEndpoint(*tc.existingAPIUser, nil, tc.existingKubermaticObjs, nil, hack.NewTestRouting)
+			ep, err := test.CreateTestEndpoint(*tc.existingAPIUser, nil, tc.existingKubermaticObjs, tc.kubermaticConfig, hack.NewTestRouting)
 			if err != nil {
 				t.Fatalf("failed to create test endpoint: %v", err)
 			}

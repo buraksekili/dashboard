@@ -50,7 +50,7 @@ func DecodeGetSeedSettingsReq(c context.Context, r *http.Request) (interface{}, 
 }
 
 // GetSeedSettingsEndpoint returns SeedSettings for a Seed cluster.
-func GetSeedSettingsEndpoint(seedsGetter provider.SeedsGetter) endpoint.Endpoint {
+func GetSeedSettingsEndpoint(seedsGetter provider.SeedsGetter, configGetter provider.KubermaticConfigurationGetter) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (interface{}, error) {
 		req, ok := request.(getSeedSettingsReq)
 		if !ok {
@@ -65,7 +65,14 @@ func GetSeedSettingsEndpoint(seedsGetter provider.SeedsGetter) endpoint.Endpoint
 		if !ok {
 			return nil, utilerrors.NewNotFound("Seed", req.Name)
 		}
-		return convertSeedToSeedSettings(seed), nil
+		seedSettings := convertSeedToSeedSettings(seed)
+
+		// the domain only builds the MLA links, so a failure must not break the other settings
+		if config, err := configGetter(ctx); err == nil {
+			seedSettings.KubermaticDomain = config.Spec.Ingress.Domain
+		}
+
+		return seedSettings, nil
 	}
 }
 

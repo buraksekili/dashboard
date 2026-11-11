@@ -20,7 +20,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net/url"
 	"os"
 	"strings"
 
@@ -28,6 +27,7 @@ import (
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 
+	handlerauth "k8c.io/dashboard/v2/pkg/handler/auth"
 	"k8c.io/dashboard/v2/pkg/provider"
 	authtypes "k8c.io/dashboard/v2/pkg/provider/auth/types"
 	"k8c.io/dashboard/v2/pkg/serviceaccount"
@@ -103,7 +103,7 @@ func newServerRunOptions() (serverRunOptions, error) {
 	flag.StringVar(&s.oidcIssuerClientID, "oidc-issuer-client-id", "", "Issuer client ID")
 	flag.StringVar(&s.oidcIssuerClientSecret, "oidc-issuer-client-secret", "", "OpenID client secret")
 	flag.StringVar(&s.oidcIssuerRedirectURI, "oidc-issuer-redirect-uri", "", "Callback URL for OpenID responses.")
-	flag.StringVar(&rawOIDCIssuerAdditionalRedirectURIs, "oidc-issuer-additional-redirect-uris", "", "Comma-separated list of additional URLs, besides -oidc-issuer-redirect-uri, the dashboard login may use for OpenID responses, e.g. when KKP is also reachable through reverse proxies on other hostnames. Only scheme, host and port are used.")
+	flag.StringVar(&rawOIDCIssuerAdditionalRedirectURIs, "oidc-issuer-additional-redirect-uris", "", "Comma-separated list of additional origins (scheme, host and optional port, lower case, without default port or path), besides the one of -oidc-issuer-redirect-uri, the dashboard may use for OpenID responses, e.g. when KKP is also reachable through reverse proxies on other hostnames. Per origin, register <origin>/api/v2/auth/callback, <origin>/api/v1/kubeconfig, <origin>/api/v2/kubeconfig/secret and <origin>/api/v2/dashboard/login as redirect URIs of the issuer client.")
 	flag.StringVar(&s.oidcIssuerCookieHashKey, "oidc-issuer-cookie-hash-key", "", "Hash key authenticates the cookie value using HMAC. It is recommended to use a key with 32 or 64 bytes.")
 	flag.BoolVar(&s.oidcIssuerCookieSecureMode, "oidc-issuer-cookie-secure-mode", true, "When true cookie received only with HTTPS. Set false for local deployment with HTTP")
 	flag.BoolVar(&s.oidcIssuerOfflineAccessAsScope, "oidc-issuer-offline-access-as-scope", true, "Set it to false if OIDC provider requires to set \"access_type=offline\" query param when accessing the refresh token")
@@ -173,12 +173,8 @@ func (o serverRunOptions) validate() error {
 	}
 
 	for _, uri := range o.oidcIssuerAdditionalRedirectURIs {
-		u, err := url.Parse(uri)
-		if err != nil {
+		if err := handlerauth.ValidateAdditionalRedirectURI(uri); err != nil {
 			return fmt.Errorf("invalid -oidc-issuer-additional-redirect-uris entry %q: %w", uri, err)
-		}
-		if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-			return fmt.Errorf("invalid -oidc-issuer-additional-redirect-uris entry %q: must be an http(s) URL with a host and without user info, query or fragment", uri)
 		}
 	}
 
