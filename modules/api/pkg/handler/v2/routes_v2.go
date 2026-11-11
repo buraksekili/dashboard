@@ -7538,7 +7538,7 @@ func (r Routing) getSeedSettings() http.Handler {
 		endpoint.Chain(
 			middleware.TokenVerifier(r.tokenVerifiers, r.userProvider),
 			middleware.UserSaver(r.userProvider),
-		)(seedsettings.GetSeedSettingsEndpoint(r.seedsGetter)),
+		)(seedsettings.GetSeedSettingsEndpoint(r.seedsGetter, r.kubermaticConfigGetter)),
 		seedsettings.DecodeGetSeedSettingsReq,
 		handler.EncodeJSON,
 		r.defaultServerOptions()...,

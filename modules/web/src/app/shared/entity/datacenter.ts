@@ -169,6 +169,7 @@ export class SeedSettings {
   metering: MeteringConfiguration;
   seedDNSOverwrite?: string;
   kubelb?: KubeLBSeedSettings;
+  kubermaticDomain?: string;
 }
 
 export class KubeLBSeedSettings {

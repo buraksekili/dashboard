@@ -18,6 +18,10 @@ import (
 // swagger:model SeedSettings
 type SeedSettings struct {
 
+	// KubermaticDomain is the KKP domain (spec.ingress.domain of the KubermaticConfiguration), which the
+	// MLA Grafana and Alertmanager hostnames of the Seed are built on.
+	KubermaticDomain string `json:"kubermaticDomain,omitempty"`
+
 	// the Seed level seed dns overwrite
 	SeedDNSOverwrite string `json:"seedDNSOverwrite,omitempty"`
 

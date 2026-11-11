@@ -238,6 +238,9 @@ type SeedSettings struct {
 	SeedDNSOverwrite string `json:"seedDNSOverwrite,omitempty"`
 	// KubeLB settings
 	KubeLB *KubeLBSeedSettingsAPI `json:"kubelb,omitempty"`
+	// KubermaticDomain is the KKP domain (spec.ingress.domain of the KubermaticConfiguration), which the
+	// MLA Grafana and Alertmanager hostnames of the Seed are built on.
+	KubermaticDomain string `json:"kubermaticDomain,omitempty"`
 }
 
 type KubeLBSeedSettingsAPI struct {

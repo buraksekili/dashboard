@@ -41502,6 +41502,11 @@
         "kubelb": {
           "$ref": "#/definitions/KubeLBSeedSettingsAPI"
         },
+        "kubermaticDomain": {
+          "description": "KubermaticDomain is the KKP domain (spec.ingress.domain of the KubermaticConfiguration), which the\nMLA Grafana and Alertmanager hostnames of the Seed are built on.",
+          "type": "string",
+          "x-go-name": "KubermaticDomain"
+        },
         "metering": {
           "$ref": "#/definitions/MeteringConfiguration"
         },
